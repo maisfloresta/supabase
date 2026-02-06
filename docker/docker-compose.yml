@@ -9,6 +9,24 @@ name: supabase
 
 services:
 
+  caddy:
+    container_name: supabase-caddy
+    image: caddy:2.10.0-alpine
+    restart: unless-stopped
+    environment:
+      PUBLIC_DOMAIN: ${PUBLIC_DOMAIN}
+      LETSENCRYPT_EMAIL: ${LETSENCRYPT_EMAIL}
+    volumes:
+      - ./volumes/caddy/Caddyfile:/etc/caddy/Caddyfile:ro,z
+      - ./volumes/caddy/data:/data:z
+      - ./volumes/caddy/config:/config:z
+    networks:
+      - default
+      - easypanel
+    depends_on:
+      kong:
+        condition: service_started
+
   studio:
     container_name: supabase-studio
     image: supabase/studio:2026.01.27-sha-6aa59ff
@@ -70,8 +88,8 @@ services:
     image: kong:2.8.1
     restart: unless-stopped
     ports:
-      - ${KONG_HTTP_PORT}:8000/tcp
-      - ${KONG_HTTPS_PORT}:8443/tcp
+      - 127.0.0.1:${KONG_HTTP_PORT}:8000/tcp
+      - 127.0.0.1:${KONG_HTTPS_PORT}:8443/tcp
     volumes:
       # https://github.com/supabase/supabase/issues/12661
       - ./volumes/api/kong.yml:/home/kong/temp.yml:ro,z
@@ -541,3 +559,7 @@ services:
 
 volumes:
   db-config:
+
+networks:
+  easypanel:
+    external: true

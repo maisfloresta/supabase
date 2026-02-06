@@ -1,5 +1,7 @@
 volumes/db/data
 volumes/storage
+volumes/caddy/data
+volumes/caddy/config
 .env
 test.http
 docker-compose.override.yml
