@@ -9,6 +9,69 @@ const supabase = createClient(supabaseUrl, supabaseKey, {
     db: { schema: 'integrations' }
 })
 
+type JsonObject = Record<string, unknown>
+
+function toScalarString(value: unknown): string | null {
+    if (value === null || value === undefined) return null
+    if (typeof value === 'string') return value
+    if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
+        return String(value)
+    }
+    return null
+}
+
+function clamp(value: string, max: number): string {
+    return value.trim().slice(0, max)
+}
+
+function getNestedObject(value: unknown): JsonObject | null {
+    if (typeof value === 'object' && value !== null) {
+        return value as JsonObject
+    }
+    return null
+}
+
+function pickEventType(payload: JsonObject): string {
+    const eventType =
+        toScalarString(payload.event) ??
+        toScalarString(payload.topic) ??
+        toScalarString(payload.type) ??
+        'unknown'
+    return clamp(eventType, 120)
+}
+
+function pickExternalEntityType(payload: JsonObject): string {
+    const resource = getNestedObject(payload.resource)
+    const candidate =
+        toScalarString(payload.resource) ??
+        toScalarString(payload.resource_type) ??
+        (resource ? toScalarString(resource.type) ?? toScalarString(resource.alias) : null) ??
+        'order'
+    return clamp(candidate, 80)
+}
+
+function pickExternalEntityId(payload: JsonObject): string {
+    const resource = getNestedObject(payload.resource)
+    const order = getNestedObject(payload.order)
+    const candidate =
+        toScalarString(payload.id) ??
+        toScalarString(payload.order_id) ??
+        toScalarString(payload.resource_id) ??
+        (resource
+            ? toScalarString(resource.id) ??
+              toScalarString(resource.order_id) ??
+              toScalarString(resource.number)
+            : null) ??
+        (order
+            ? toScalarString(order.id) ??
+              toScalarString(order.order_id) ??
+              toScalarString(order.number)
+            : null) ??
+        crypto.randomUUID()
+
+    return clamp(candidate, 255)
+}
+
 serve(async (req) => {
     try {
         const { method } = req
@@ -20,14 +83,15 @@ serve(async (req) => {
             )
         }
 
-        const payload = await req.json()
+        const payload = await req.json() as JsonObject
         const headers = Object.fromEntries(req.headers.entries())
 
         console.log('CartPanda Webhook - Received:', payload)
 
-        // Gerar dedupe_key único
-        const externalEntityId = payload.id || payload.order_id || crypto.randomUUID()
-        const eventType = payload.event || 'unknown'
+        // Extrai campos indexados de forma segura (sem gravar objetos gigantes em colunas text indexadas)
+        const externalEntityId = pickExternalEntityId(payload)
+        const eventType = pickEventType(payload)
+        const externalEntityType = pickExternalEntityType(payload)
         const dedupeKey = `cartpanda_${eventType}_${externalEntityId}`
 
         // 1. Criar registro em integrations.integration_events
@@ -36,8 +100,8 @@ serve(async (req) => {
             .insert({
                 source: 'cartpanda',
                 event_type: eventType,
-                external_entity_type: payload.resource || 'order',
-                external_entity_id: String(externalEntityId),
+                external_entity_type: externalEntityType,
+                external_entity_id: externalEntityId,
                 dedupe_key: dedupeKey,
                 status: 'received',
                 headers: headers,
