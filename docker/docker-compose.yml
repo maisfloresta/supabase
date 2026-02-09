@@ -31,6 +31,9 @@ services:
     container_name: supabase-studio
     image: supabase/studio:2026.01.27-sha-6aa59ff
     restart: unless-stopped
+    networks:
+      - default
+      - easypanel
     healthcheck:
       test:
         [
@@ -87,6 +90,9 @@ services:
     container_name: supabase-kong
     image: kong:2.8.1
     restart: unless-stopped
+    networks:
+      - default
+      - easypanel
     ports:
       - 127.0.0.1:${KONG_HTTP_PORT}:8000/tcp
       - 127.0.0.1:${KONG_HTTPS_PORT}:8443/tcp
@@ -359,6 +365,9 @@ services:
       SUPABASE_ANON_KEY: ${ANON_KEY}
       SUPABASE_SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
       SUPABASE_DB_URL: postgresql://postgres:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}
+      WEBHOOK_SHARED_TOKEN: ${WEBHOOK_SHARED_TOKEN}
+      YAMPI_WEBHOOK_SECRET: ${YAMPI_WEBHOOK_SECRET}
+      CARTPANDA_WEBHOOK_SECRET: ${CARTPANDA_WEBHOOK_SECRET}
       # TODO: Allow configuring VERIFY_JWT per function. This PR might help: https://github.com/supabase/cli/pull/786
       VERIFY_JWT: "${FUNCTIONS_VERIFY_JWT}"
     command:
@@ -421,6 +430,8 @@ services:
     image: supabase/postgres:15.8.1.085
     restart: unless-stopped
     volumes:
+      - ./volumes/db/init/00-webhook-events.sql:/docker-entrypoint-initdb.d/migrations/100-webhook-events.sql:Z
+      - ./volumes/db/init/01-webhook-processing.sql:/docker-entrypoint-initdb.d/migrations/101-webhook-processing.sql:Z
       - ./volumes/db/realtime.sql:/docker-entrypoint-initdb.d/migrations/99-realtime.sql:Z
       # Must be superuser to create event trigger
       - ./volumes/db/webhooks.sql:/docker-entrypoint-initdb.d/init-scripts/98-webhooks.sql:Z
