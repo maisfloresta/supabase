@@ -3,6 +3,7 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
 const supabaseUrl = Deno.env.get('SUPABASE_URL')!
 const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
+const jobsRunnerUrl = `${supabaseUrl}/functions/v1/jobs-runner`
 
 // Cliente com schema integrations
 const supabase = createClient(supabaseUrl, supabaseKey, {
@@ -29,6 +30,33 @@ function getNestedObject(value: unknown): JsonObject | null {
         return value as JsonObject
     }
     return null
+}
+
+async function triggerJobsRunner(): Promise<void> {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 2500)
+
+    try {
+        const response = await fetch(jobsRunnerUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                apikey: supabaseKey,
+                Authorization: `Bearer ${supabaseKey}`
+            },
+            body: '{}',
+            signal: controller.signal
+        })
+
+        if (!response.ok) {
+            const body = await response.text()
+            console.warn('jobs-runner trigger failed:', response.status, body)
+        }
+    } catch (error) {
+        console.warn('jobs-runner trigger error:', error)
+    } finally {
+        clearTimeout(timeout)
+    }
 }
 
 function pickEventType(payload: JsonObject): string {
@@ -148,6 +176,9 @@ serve(async (req) => {
                 throw jobError
             }
         }
+
+        // Dispara processamento imediato (best-effort) para não depender de cron externo.
+        await triggerJobsRunner()
 
         console.log(`CartPanda webhook enqueued - Event ID: ${event.id}, Job ID: ${job?.id}`)
 
