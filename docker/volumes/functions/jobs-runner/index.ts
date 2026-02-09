@@ -3,6 +3,7 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
 const supabaseUrl = Deno.env.get('SUPABASE_URL')!
 const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
+const internalWebhookToken = Deno.env.get('WEBHOOK_SHARED_TOKEN') ?? ''
 
 const supabase = createClient(supabaseUrl, supabaseKey, {
   db: { schema: 'integrations' },
@@ -18,8 +19,42 @@ interface IntegrationEventRow {
   payload: unknown
 }
 
-serve(async () => {
+function parseBearerToken(headerValue: string | null): string | null {
+  if (!headerValue) return null
+  const [scheme, token] = headerValue.trim().split(/\s+/, 2)
+  if (!scheme || !token) return null
+  if (scheme.toLowerCase() !== 'bearer') return null
+  return token
+}
+
+function isAuthorizedRequest(req: Request): boolean {
+  if (!internalWebhookToken) return false
+
+  const directToken = req.headers.get('x-webhook-shared-token')
+  if (directToken && directToken === internalWebhookToken) return true
+
+  const bearerToken = parseBearerToken(req.headers.get('authorization'))
+  if (bearerToken && bearerToken === internalWebhookToken) return true
+
+  return false
+}
+
+serve(async (req) => {
   try {
+    if (req.method !== 'POST') {
+      return new Response(JSON.stringify({ success: false, error: 'Method not allowed' }), {
+        headers: { 'Content-Type': 'application/json' },
+        status: 405,
+      })
+    }
+
+    if (!isAuthorizedRequest(req)) {
+      return new Response(JSON.stringify({ success: false, error: 'Unauthorized' }), {
+        headers: { 'Content-Type': 'application/json' },
+        status: 401,
+      })
+    }
+
     console.log('Jobs Runner - Starting job processing')
 
     const workerId = `worker_${crypto.randomUUID().slice(0, 8)}`

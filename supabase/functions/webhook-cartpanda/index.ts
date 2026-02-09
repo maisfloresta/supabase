@@ -4,6 +4,7 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 const supabaseUrl = Deno.env.get('SUPABASE_URL')!
 const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
 const jobsRunnerUrl = `${supabaseUrl}/functions/v1/jobs-runner`
+const internalWebhookToken = Deno.env.get('WEBHOOK_SHARED_TOKEN') ?? ''
 
 // Cliente com schema integrations
 const supabase = createClient(supabaseUrl, supabaseKey, {
@@ -42,7 +43,8 @@ async function triggerJobsRunner(): Promise<void> {
             headers: {
                 'Content-Type': 'application/json',
                 apikey: supabaseKey,
-                Authorization: `Bearer ${supabaseKey}`
+                Authorization: `Bearer ${supabaseKey}`,
+                'x-webhook-shared-token': internalWebhookToken
             },
             body: '{}',
             signal: controller.signal
@@ -57,6 +59,40 @@ async function triggerJobsRunner(): Promise<void> {
     } finally {
         clearTimeout(timeout)
     }
+}
+
+async function resolveStoreId(source: 'yampi' | 'cartpanda', externalStoreId: string | null): Promise<string | null> {
+    if (!externalStoreId) return null
+
+    const { data, error } = await supabase
+        .from('store_external_links')
+        .select('store_id')
+        .eq('source', source)
+        .eq('external_store_id', externalStoreId)
+        .maybeSingle()
+
+    if (error) {
+        console.warn('Error resolving store mapping:', error)
+        return null
+    }
+
+    return toScalarString(data?.store_id)
+}
+
+function pickSourceStoreId(payload: JsonObject): string | null {
+    const order = getNestedObject(payload.order)
+    const webhook = getNestedObject(payload.webhook)
+    const shop = getNestedObject(payload.shop)
+    const shopInfo = getNestedObject(payload.shop_info)
+
+    const candidate =
+        toScalarString(payload.shop_id) ??
+        (order ? toScalarString(order.shop_id) : null) ??
+        (webhook ? toScalarString(webhook.shop_id) : null) ??
+        (shop ? toScalarString(shop.id) : null) ??
+        (shopInfo ? toScalarString(shopInfo.id) : null)
+
+    return candidate ? clamp(candidate, 120) : null
 }
 
 function pickEventType(payload: JsonObject): string {
@@ -120,6 +156,8 @@ serve(async (req) => {
         const externalEntityId = pickExternalEntityId(payload)
         const eventType = pickEventType(payload)
         const externalEntityType = pickExternalEntityType(payload)
+        const sourceStoreId = pickSourceStoreId(payload)
+        const storeId = await resolveStoreId('cartpanda', sourceStoreId)
         const dedupeKey = `cartpanda_${eventType}_${externalEntityId}`
 
         // 1. Criar registro em integrations.integration_events
@@ -130,6 +168,7 @@ serve(async (req) => {
                 event_type: eventType,
                 external_entity_type: externalEntityType,
                 external_entity_id: externalEntityId,
+                store_id: storeId,
                 dedupe_key: dedupeKey,
                 status: 'received',
                 headers: headers,
