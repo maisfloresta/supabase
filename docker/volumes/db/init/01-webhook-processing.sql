@@ -23,12 +23,6 @@ begin
   end if;
 
   num := cleaned::numeric;
-  if cleaned ~ '^\-?\d+$' then
-    -- Heuristic: integer >= 1000 is likely already cents.
-    if abs(num) >= 1000 then
-      return num::bigint;
-    end if;
-  end if;
 
   return round(num * 100)::bigint;
 exception

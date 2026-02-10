@@ -990,7 +990,6 @@ function moneyToCents(value: unknown): number | null {
   if (value === null || value === undefined) return null
 
   if (typeof value === 'number' && Number.isFinite(value)) {
-    if (Number.isInteger(value) && Math.abs(value) >= 1000) return Math.round(value)
     return Math.round(value * 100)
   }
 
@@ -1005,8 +1004,6 @@ function moneyToCents(value: unknown): number | null {
 
   const n = Number(normalized)
   if (!Number.isFinite(n)) return null
-
-  if (/^-?\d+$/.test(cleaned) && Math.abs(n) >= 1000) return Math.round(n)
 
   return Math.round(n * 100)
 }
