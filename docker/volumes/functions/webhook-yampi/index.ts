@@ -5,6 +5,7 @@ const supabaseUrl = Deno.env.get('SUPABASE_URL')!
 const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
 const jobsRunnerUrl = `${supabaseUrl}/functions/v1/jobs-runner`
 const internalWebhookToken = Deno.env.get('WEBHOOK_SHARED_TOKEN') ?? ''
+const providerWebhookToken = Deno.env.get('YAMPI_WEBHOOK_SECRET') ?? ''
 
 // Cliente com schema integrations
 const supabase = createClient(supabaseUrl, supabaseKey, {
@@ -12,6 +13,44 @@ const supabase = createClient(supabaseUrl, supabaseKey, {
 })
 
 type JsonObject = Record<string, unknown>
+
+function parseBearerToken(headerValue: string | null): string | null {
+    if (!headerValue) return null
+    const [scheme, token] = headerValue.trim().split(/\s+/, 2)
+    if (!scheme || !token) return null
+    if (scheme.toLowerCase() !== 'bearer') return null
+    return token
+}
+
+function getRequestWebhookToken(req: Request): string | null {
+    const url = new URL(req.url)
+    const queryToken =
+        url.searchParams.get('token') ??
+        url.searchParams.get('webhook_token') ??
+        url.searchParams.get('secret')
+    if (queryToken) return queryToken
+
+    const directToken = req.headers.get('x-webhook-shared-token')
+    if (directToken) return directToken
+
+    return parseBearerToken(req.headers.get('authorization'))
+}
+
+function isAuthorizedRequest(req: Request): boolean {
+    const validTokens = [providerWebhookToken, internalWebhookToken]
+        .map((token) => token.trim())
+        .filter((token) => token.length > 0)
+
+    if (validTokens.length === 0) {
+        console.error('Missing webhook token configuration (YAMPI_WEBHOOK_SECRET or WEBHOOK_SHARED_TOKEN)')
+        return false
+    }
+
+    const requestToken = getRequestWebhookToken(req)
+    if (!requestToken) return false
+
+    return validTokens.includes(requestToken)
+}
 
 function toScalarString(value: unknown): string | null {
     if (value === null || value === undefined) return null
@@ -144,6 +183,13 @@ serve(async (req) => {
             return new Response(
                 JSON.stringify({ message: 'Yampi Webhook Receiver - Use POST' }),
                 { headers: { 'Content-Type': 'application/json' }, status: 405 }
+            )
+        }
+
+        if (!isAuthorizedRequest(req)) {
+            return new Response(
+                JSON.stringify({ success: false, error: 'Unauthorized' }),
+                { headers: { 'Content-Type': 'application/json' }, status: 401 }
             )
         }
 

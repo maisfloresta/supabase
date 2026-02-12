@@ -10,7 +10,7 @@ project_id = "xguihxuzqibwxjnimxev"
 port = 54321
 # Schemas to expose in your API. Tables, views and stored procedures in this schema will get API
 # endpoints. public and storage are always included.
-schemas = ["public", "content", "storage", "graphql_public"]
+schemas = ["public", "content", "storage", "graphql_public", "integrations", "core", "yampi", "cartpanda"]
 # Extra schemas to add to the search_path of every request. public is always included.
 extra_search_path = ["public", "extensions"]
 # The maximum number of rows returns from a view, table, or stored procedure. Limits payload size
@@ -18,7 +18,7 @@ extra_search_path = ["public", "extensions"]
 max_rows = 1000
 
 [remotes.prod.api]
-schemas = ["public", "content", "storage", "graphql_public"]
+schemas = ["public", "content", "storage", "graphql_public", "integrations", "core", "yampi", "cartpanda"]
 
 [db]
 # Port to use for the local database URL.
@@ -50,11 +50,13 @@ objects_path = "buckets/fonts"
 [auth]
 # The base URL of your website. Used as an allow-list for redirects and for constructing URLs used
 # in emails.
-site_url = "http://localhost:3000"
+site_url = "https://app.maisfloresta.cloud"
 # A list of *exact* URLs that auth providers are permitted to redirect to post authentication.
 additional_redirect_urls = [
     "https://*-supabase.vercel.app/*/*",
     "https://supabase.com/*/*",
+    "https://app.maisfloresta.cloud/*",
+    "https://app.maisfloresta.cloud/*/*",
     "http://localhost:3000/*/*",
 ]
 # How long tokens are valid for, in seconds. Defaults to 3600 (1 hour), maximum 604,800 seconds (one
