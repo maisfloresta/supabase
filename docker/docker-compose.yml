@@ -95,6 +95,13 @@ services:
     volumes:
       - ./volumes/snippets:/app/snippets:Z
       - ./volumes/functions:/app/edge-functions:Z
+      - ./volumes/studio/patch-storage-endpoint.js:/app/patch-storage-endpoint.js:ro
+    command:
+      [
+        "sh",
+        "-lc",
+        "node /app/patch-storage-endpoint.js && exec node apps/studio/server.js"
+      ]
 
   kong:
     container_name: supabase-kong
