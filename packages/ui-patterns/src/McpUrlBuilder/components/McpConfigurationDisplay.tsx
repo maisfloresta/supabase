@@ -86,7 +86,7 @@ export function McpConfigurationDisplay({
             >
               <Image
                 src={mcpButtonData.imageSrc}
-                alt=""
+                alt={`${selectedClient.label} icon`}
                 width={16}
                 height={16}
                 className="shrink-0"
@@ -98,7 +98,7 @@ export function McpConfigurationDisplay({
       )}
 
       {selectedClient.primaryInstructions &&
-        selectedClient.primaryInstructions(clientConfig, onCopyCallback)}
+        selectedClient.primaryInstructions(clientConfig, onCopyCallback, { isPlatform })}
 
       {selectedClient.configFile && (
         <>
@@ -122,7 +122,7 @@ export function McpConfigurationDisplay({
       )}
 
       {selectedClient.alternateInstructions &&
-        selectedClient.alternateInstructions(clientConfig, onCopyCallback)}
+        selectedClient.alternateInstructions(clientConfig, onCopyCallback, { isPlatform })}
 
       {(selectedClient.docsUrl || selectedClient.externalDocsUrl) && (
         <div className="flex items-center gap-2 text-xs text-foreground-light">
@@ -132,7 +132,7 @@ export function McpConfigurationDisplay({
               href={selectedClient.docsUrl}
               target="_blank"
               rel="noopener noreferrer"
-              className="text-brand hover:underline inline-flex items-center"
+              className="text-brand-link hover:underline inline-flex items-center"
             >
               View setup guide
               <ExternalLink className="h-3 w-3 ml-1" />
@@ -143,7 +143,7 @@ export function McpConfigurationDisplay({
               href={selectedClient.externalDocsUrl}
               target="_blank"
               rel="noopener noreferrer"
-              className="text-brand hover:underline inline-flex items-center"
+              className="text-brand-link hover:underline inline-flex items-center"
             >
               View {selectedClient.label} docs
               <ExternalLink className="h-3 w-3 ml-1" />
