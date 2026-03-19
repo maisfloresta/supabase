@@ -450,6 +450,7 @@ services:
       WEBHOOK_SHARED_TOKEN: ${WEBHOOK_SHARED_TOKEN}
       YAMPI_WEBHOOK_SECRET: ${YAMPI_WEBHOOK_SECRET}
       CARTPANDA_WEBHOOK_SECRET: ${CARTPANDA_WEBHOOK_SECRET}
+      ABACATEPAY_API_KEY: ${ABACATEPAY_API_KEY}
       # TODO: Allow configuring VERIFY_JWT per function. This PR might help: https://github.com/supabase/cli/pull/786
       VERIFY_JWT: "${FUNCTIONS_VERIFY_JWT}"
     command:
