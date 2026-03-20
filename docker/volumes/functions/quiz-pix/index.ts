@@ -3,6 +3,7 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 const ABACATEPAY_API_URL = 'https://api.abacatepay.com';
 const CHECKOUT_DESCRIPTION = 'Receba Sementes - Mais Floresta';
 const CHECKOUT_EXPIRATION_SECONDS = 60 * 60; // 1 hour
+const FREIGHT_CENTS = 2500; // R$ 25,00
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -49,13 +50,7 @@ function mapStatus(status: string | null | undefined) {
 
 // ─── Product catalog (matches UpsellScreen) ───
 
-interface CatalogItem {
-  id: number;
-  name: string;
-  options: { label: string; subtitle: string; priceCents: number }[];
-}
-
-const CATALOG: Record<string, CatalogItem> = {
+const CATALOG: Record<string, { id: number; name: string; options: { label: string; subtitle: string; priceCents: number }[] }> = {
   mix: {
     id: 1,
     name: 'Mix Sementes Ipê 5 Cores',
@@ -88,14 +83,24 @@ const CATALOG: Record<string, CatalogItem> = {
 const GIFT_THRESHOLD_CENTS = 12000; // R$ 120
 
 interface CartInput {
-  mix?: number | null;       // option index (0, 1, 2) or null
+  mix?: number | null;
   bandeja?: number | null;
   fertilizante?: number | null;
 }
 
+interface ShippingAddress {
+  cep: string;
+  street: string;
+  number: string;
+  complement?: string;
+  neighborhood: string;
+  city: string;
+  state: string;
+}
+
 function validateAndCalculateCart(cart: CartInput) {
   const lineItems: { productId: number; name: string; optionLabel: string; quantity: number; unitPriceCents: number; totalCents: number }[] = [];
-  let totalCents = 0;
+  let subtotalCents = 0;
 
   for (const [key, optionIndex] of Object.entries(cart)) {
     if (optionIndex === null || optionIndex === undefined) continue;
@@ -114,17 +119,19 @@ function validateAndCalculateCart(cart: CartInput) {
       unitPriceCents: option.priceCents,
       totalCents: option.priceCents,
     });
-    totalCents += option.priceCents;
+    subtotalCents += option.priceCents;
   }
 
   if (lineItems.length === 0) {
     throw new Error('Nenhum item selecionado.');
   }
 
-  const hasGift = totalCents >= GIFT_THRESHOLD_CENTS;
+  const hasGift = subtotalCents >= GIFT_THRESHOLD_CENTS;
   const freeShipping = lineItems.length === 3;
+  const freightCents = freeShipping ? 0 : FREIGHT_CENTS;
+  const totalCents = subtotalCents + freightCents;
 
-  return { lineItems, totalCents, hasGift, freeShipping };
+  return { lineItems, subtotalCents, totalCents, freightCents, hasGift, freeShipping };
 }
 
 // ─── AbacatePay API ───
@@ -155,16 +162,24 @@ async function abacatePayRequest(path: string, init: RequestInit) {
 interface CreateInput {
   customerName: string;
   customerPhone: string;
+  customerCpf: string;
   customerRegion?: string;
   selectedColor?: string;
   quizAnswers?: Record<string, unknown>;
   cart: CartInput;
+  shipping: ShippingAddress;
 }
 
 async function createPixCharge(input: CreateInput) {
   const admin = createAdminClient();
-  const { lineItems, totalCents, hasGift, freeShipping } = validateAndCalculateCart(input.cart);
+  const { lineItems, subtotalCents, totalCents, freightCents, hasGift, freeShipping } = validateAndCalculateCart(input.cart);
   const orderCode = buildOrderCode();
+
+  // Validate shipping
+  const s = input.shipping;
+  if (!s.cep || !s.street || !s.number || !s.neighborhood || !s.city || !s.state) {
+    throw new Error('Endereço de envio incompleto.');
+  }
 
   // 1. Create pending order in DB
   const { data: order, error: orderError } = await admin
@@ -173,13 +188,22 @@ async function createPixCharge(input: CreateInput) {
       order_code: orderCode,
       customer_name: input.customerName,
       customer_phone: input.customerPhone,
+      customer_cpf: input.customerCpf,
       customer_region: input.customerRegion ?? null,
       selected_color: input.selectedColor ?? null,
       quiz_answers: input.quizAnswers ?? {},
       items: lineItems,
       total_cents: totalCents,
+      freight_cents: freightCents,
       has_gift: hasGift,
       free_shipping: freeShipping,
+      shipping_cep: s.cep,
+      shipping_street: s.street,
+      shipping_number: s.number,
+      shipping_complement: s.complement ?? null,
+      shipping_neighborhood: s.neighborhood,
+      shipping_city: s.city,
+      shipping_state: s.state,
     })
     .select('id, order_code')
     .single();
@@ -188,28 +212,31 @@ async function createPixCharge(input: CreateInput) {
     throw new Error(`Não foi possível criar o pedido: ${orderError?.message ?? 'sem retorno'}`);
   }
 
-  // 2. Create PIX charge in AbacatePay
+  // 2. Create charge in AbacatePay (PIX + CARD)
   try {
-    const createPayload = await abacatePayRequest('/v1/pixQrCode/create', {
+    const createPayload = await abacatePayRequest('/v2/transparents/create', {
       method: 'POST',
       body: JSON.stringify({
-        amount: totalCents,
-        description: CHECKOUT_DESCRIPTION,
-        expiresIn: CHECKOUT_EXPIRATION_SECONDS,
-        metadata: {
-          source: 'quiz-recebasementes',
-          quizOrderId: String(order.id),
-          quizOrderCode: String(order.order_code),
-          totalCents: String(totalCents),
-          customerName: input.customerName,
-          customerPhone: input.customerPhone,
+        method: ['PIX', 'CARD'],
+        data: {
+          amount: totalCents,
+          description: CHECKOUT_DESCRIPTION,
+          expiresIn: CHECKOUT_EXPIRATION_SECONDS,
+          metadata: {
+            source: 'quiz-recebasementes',
+            quizOrderId: String(order.id),
+            quizOrderCode: String(order.order_code),
+            totalCents: String(totalCents),
+            customerName: input.customerName,
+            customerPhone: input.customerPhone,
+          },
         },
       }),
     });
 
     const chargeData = (createPayload as any)?.data;
     if (!chargeData?.id) {
-      throw new Error('Resposta inválida ao gerar o PIX.');
+      throw new Error('Resposta inválida ao gerar o pagamento.');
     }
 
     const mapped = mapStatus(chargeData.status);
@@ -232,9 +259,12 @@ async function createPixCharge(input: CreateInput) {
     return {
       orderCode: order.order_code,
       pixId: chargeData.id,
+      subtotalCents,
+      freightCents,
       amountCents: totalCents,
       brCode: chargeData.brCode ?? '',
       brCodeBase64: chargeData.brCodeBase64 ?? null,
+      checkoutUrl: chargeData.url ?? null,
       status: (chargeData.status ?? 'PENDING').toUpperCase(),
       expiresAt: chargeData.expiresAt ?? null,
       hasGift,
@@ -261,12 +291,11 @@ async function checkPixStatus(pixId: string) {
 
   const chargeData = (statusPayload as any)?.data;
   if (!chargeData) {
-    throw new Error('Resposta inválida ao consultar o PIX.');
+    throw new Error('Resposta inválida ao consultar o pagamento.');
   }
 
   const mapped = mapStatus(chargeData.status);
 
-  // Update order in DB
   const updatePayload: Record<string, unknown> = {
     payment_status: mapped.paymentStatus,
     order_status: mapped.orderStatus,
@@ -311,13 +340,24 @@ Deno.serve(async (req) => {
     const action = body.action;
 
     if (action === 'create') {
+      const shipping = (body.shipping ?? {}) as Record<string, unknown>;
       const data = await createPixCharge({
         customerName: String(body.customerName ?? ''),
         customerPhone: String(body.customerPhone ?? ''),
+        customerCpf: String(body.customerCpf ?? ''),
         customerRegion: body.customerRegion ? String(body.customerRegion) : undefined,
         selectedColor: body.selectedColor ? String(body.selectedColor) : undefined,
         quizAnswers: typeof body.quizAnswers === 'object' ? (body.quizAnswers as Record<string, unknown>) : undefined,
         cart: (body.cart ?? {}) as CartInput,
+        shipping: {
+          cep: String(shipping.cep ?? ''),
+          street: String(shipping.street ?? ''),
+          number: String(shipping.number ?? ''),
+          complement: shipping.complement ? String(shipping.complement) : undefined,
+          neighborhood: String(shipping.neighborhood ?? ''),
+          city: String(shipping.city ?? ''),
+          state: String(shipping.state ?? ''),
+        },
       });
       return jsonResponse({ success: true, data });
     }
