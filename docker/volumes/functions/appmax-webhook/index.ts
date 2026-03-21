@@ -61,6 +61,13 @@ Deno.serve(async (req) => {
     return new Response("ok", { headers: corsHeaders });
   }
 
+  if (req.method === "HEAD") {
+    return new Response(null, {
+      status: 200,
+      headers: corsHeaders,
+    });
+  }
+
   if (req.method === "GET") {
     return jsonResponse({
       ok: true,
