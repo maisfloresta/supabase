@@ -136,8 +136,8 @@ function validateAndCalculateCart(cart: CartInput) {
 
 // ─── AbacatePay API ───
 
-async function abacatePayRequest(path: string, init: RequestInit) {
-  const apiKey = getEnv('ABACATEPAY_API_KEY');
+async function abacatePayRequest(path: string, init: RequestInit, useV1Key = false) {
+  const apiKey = useV1Key ? getEnv('ABACATEPAY_API_KEY_V1') : getEnv('ABACATEPAY_API_KEY');
   const response = await fetch(`${ABACATEPAY_API_URL}${path}`, {
     ...init,
     headers: {
@@ -148,6 +148,8 @@ async function abacatePayRequest(path: string, init: RequestInit) {
   });
 
   const payload = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+
+  console.error(`[AbacatePay] ${path} -> status=${response.status} response=${JSON.stringify(payload)}`);
 
   if (!response.ok) {
     const msg = (payload as any)?.error || (payload as any)?.message || 'Falha ao comunicar com a AbacatePay.';
@@ -163,6 +165,7 @@ interface CreateInput {
   customerName: string;
   customerPhone: string;
   customerCpf: string;
+  customerEmail?: string;
   customerRegion?: string;
   selectedColor?: string;
   quizAnswers?: Record<string, unknown>;
@@ -217,7 +220,7 @@ async function createPixCharge(input: CreateInput) {
     const createPayload = await abacatePayRequest('/v2/transparents/create', {
       method: 'POST',
       body: JSON.stringify({
-        method: ['PIX', 'CARD'],
+        method: 'PIX',
         data: {
           amount: totalCents,
           description: CHECKOUT_DESCRIPTION,
@@ -256,6 +259,43 @@ async function createPixCharge(input: CreateInput) {
       })
       .eq('order_code', orderCode);
 
+    // 4. Create billing (v1) for card checkout URL
+    let checkoutUrl: string | null = null;
+    try {
+      const billingProducts = lineItems.map((item) => ({
+        externalId: String(item.productId),
+        name: `${item.name} - ${item.optionLabel}`,
+        quantity: item.quantity,
+        price: item.totalCents,
+      }));
+      if (freightCents > 0) {
+        billingProducts.push({ externalId: 'frete', name: 'Frete', quantity: 1, price: freightCents });
+      }
+
+      const billingPayload = await abacatePayRequest('/v1/billing/create', {
+        method: 'POST',
+        body: JSON.stringify({
+          methods: ['CARD'],
+          products: billingProducts,
+          frequency: 'ONE_TIME',
+          maxInstallments: 12,
+          customerPaysFees: true,
+          returnUrl: 'https://recebasementes.maisfloresta.cloud',
+          completionUrl: 'https://recebasementes.maisfloresta.cloud',
+          customer: {
+            name: input.customerName,
+            email: input.customerEmail || `${input.customerCpf}@cliente.maisfloresta.cloud`,
+            cellphone: input.customerPhone,
+            taxId: input.customerCpf,
+          },
+        }),
+      }, true);
+
+      checkoutUrl = (billingPayload as any)?.data?.url ?? null;
+    } catch (billingErr) {
+      console.error('[quiz-pix] billing create failed (card checkout unavailable):', billingErr);
+    }
+
     return {
       orderCode: order.order_code,
       pixId: chargeData.id,
@@ -264,7 +304,7 @@ async function createPixCharge(input: CreateInput) {
       amountCents: totalCents,
       brCode: chargeData.brCode ?? '',
       brCodeBase64: chargeData.brCodeBase64 ?? null,
-      checkoutUrl: chargeData.url ?? null,
+      checkoutUrl,
       status: (chargeData.status ?? 'PENDING').toUpperCase(),
       expiresAt: chargeData.expiresAt ?? null,
       hasGift,
@@ -345,6 +385,7 @@ Deno.serve(async (req) => {
         customerName: String(body.customerName ?? ''),
         customerPhone: String(body.customerPhone ?? ''),
         customerCpf: String(body.customerCpf ?? ''),
+        customerEmail: body.customerEmail ? String(body.customerEmail) : undefined,
         customerRegion: body.customerRegion ? String(body.customerRegion) : undefined,
         selectedColor: body.selectedColor ? String(body.selectedColor) : undefined,
         quizAnswers: typeof body.quizAnswers === 'object' ? (body.quizAnswers as Record<string, unknown>) : undefined,
