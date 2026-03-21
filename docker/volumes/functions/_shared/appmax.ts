@@ -1,6 +1,7 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
 
 function toBase64(bytes: Uint8Array) {
   let binary = "";
@@ -10,6 +11,17 @@ function toBase64(bytes: Uint8Array) {
   }
 
   return btoa(binary);
+}
+
+function fromBase64(value: string) {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+
+  return bytes;
 }
 
 export function getRequiredEnv(name: string) {
@@ -48,7 +60,13 @@ async function getEncryptionKey() {
     textEncoder.encode(secret),
   );
 
-  return crypto.subtle.importKey("raw", digest, "AES-GCM", false, ["encrypt"]);
+  return crypto.subtle.importKey(
+    "raw",
+    digest,
+    "AES-GCM",
+    false,
+    ["encrypt", "decrypt"],
+  );
 }
 
 export async function encryptSecret(plaintext: string) {
@@ -61,6 +79,23 @@ export async function encryptSecret(plaintext: string) {
   );
 
   return `v1:${toBase64(iv)}:${toBase64(new Uint8Array(ciphertext))}`;
+}
+
+export async function decryptSecret(ciphertext: string) {
+  const [version, ivBase64, payloadBase64] = ciphertext.split(":");
+
+  if (version !== "v1" || !ivBase64 || !payloadBase64) {
+    throw new Error("Formato de segredo Appmax inválido.");
+  }
+
+  const key = await getEncryptionKey();
+  const plaintext = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: fromBase64(ivBase64) },
+    key,
+    fromBase64(payloadBase64),
+  );
+
+  return textDecoder.decode(plaintext);
 }
 
 export async function sha256Hex(input: string) {
