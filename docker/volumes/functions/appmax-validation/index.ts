@@ -1,14 +1,11 @@
 import {
+  createOrGetAppmaxInstallation,
   createSupabaseAdminClient,
-  encryptSecret,
-  getClientIp,
-  redactMerchantCredentials,
-  sha256Hex,
+  getAppmaxAppId,
 } from "../_shared/appmax.ts";
 import { corsHeaders } from "../_shared/cors.ts";
 
-const APPMAX_APP_ID = Deno.env.get("APPMAX_APP_ID") ??
-  "b6c8b0b4-ee85-4639-a249-4b1415aa42e7";
+const APPMAX_APP_ID = getAppmaxAppId();
 
 interface ValidationPayload {
   app_id: string;
@@ -126,98 +123,26 @@ function normalizePayload(body: Record<string, unknown>): ValidationPayload {
   return payload;
 }
 
-async function findExistingInstallation(
-  adminClient: ReturnType<typeof createSupabaseAdminClient>,
-  input: {
-    appId: string;
-    externalKey: string;
-    credentialFingerprint: string;
-  },
-) {
-  const { data, error } = await adminClient
-    .schema("appmax")
-    .from("installations")
-    .select("external_id")
-    .eq("app_id", input.appId)
-    .eq("external_key", input.externalKey)
-    .eq("credential_fingerprint", input.credentialFingerprint)
-    .maybeSingle();
-
-  if (error) {
-    throw new Error(
-      `Não foi possível consultar a instalação Appmax: ${error.message}`,
-    );
-  }
-
-  return data ? String(data.external_id) : null;
-}
-
 async function createInstallation(
   adminClient: ReturnType<typeof createSupabaseAdminClient>,
   req: Request,
   payload: ValidationPayload,
 ) {
-  const credentialFingerprint = await sha256Hex(
-    `${payload.client_id}:${payload.client_secret}`,
+  return createOrGetAppmaxInstallation(
+    adminClient,
+    req,
+    {
+      appId: payload.app_id,
+      clientId: payload.client_id,
+      clientSecret: payload.client_secret,
+      externalKey: payload.external_key,
+    },
+    {
+      contentType: req.headers.get("content-type"),
+      receivedKeys: Object.keys(payload).sort(),
+      source: "validation",
+    },
   );
-  const existingExternalId = await findExistingInstallation(adminClient, {
-    appId: payload.app_id,
-    externalKey: payload.external_key,
-    credentialFingerprint,
-  });
-
-  if (existingExternalId) {
-    return existingExternalId;
-  }
-
-  const externalId = crypto.randomUUID();
-  const merchantClientIdEncrypted = await encryptSecret(payload.client_id);
-  const merchantClientSecretEncrypted = await encryptSecret(
-    payload.client_secret,
-  );
-  const sourceIp = getClientIp(req);
-  const userAgent = req.headers.get("user-agent");
-  const requestContentType = req.headers.get("content-type");
-
-  const { error } = await adminClient
-    .schema("appmax")
-    .from("installations")
-    .insert({
-      external_id: externalId,
-      app_id: payload.app_id,
-      external_key: payload.external_key,
-      credential_fingerprint: credentialFingerprint,
-      merchant_client_id_encrypted: merchantClientIdEncrypted,
-      merchant_client_secret_encrypted: merchantClientSecretEncrypted,
-      source_ip: sourceIp,
-      user_agent: userAgent,
-      payload: redactMerchantCredentials({
-        appId: payload.app_id,
-        externalKey: payload.external_key,
-        contentType: requestContentType,
-        receivedKeys: Object.keys(payload).sort(),
-      }),
-    });
-
-  if (error) {
-    if (error.code === "23505") {
-      const concurrentExternalId = await findExistingInstallation(adminClient, {
-        appId: payload.app_id,
-        externalKey: payload.external_key,
-        credentialFingerprint,
-      });
-
-      if (concurrentExternalId) {
-        return concurrentExternalId;
-      }
-    }
-
-    throw new Error(
-      `Não foi possível registrar a instalação Appmax: ${error.message}`,
-    );
-  }
-
-  return externalId;
 }
 
 Deno.serve(async (req) => {
