@@ -461,6 +461,7 @@ services:
       CARTPANDA_WEBHOOK_SECRET: ${CARTPANDA_WEBHOOK_SECRET}
       ABACATEPAY_API_KEY: ${ABACATEPAY_API_KEY}
       ABACATEPAY_API_KEY_V1: ${ABACATEPAY_API_KEY_V1}
+      BOTCONVERSA_WEBHOOK_URL: ${BOTCONVERSA_WEBHOOK_URL}
       # TODO: Allow configuring VERIFY_JWT per function. This PR might help: https://github.com/supabase/cli/pull/786
       VERIFY_JWT: "${FUNCTIONS_VERIFY_JWT}"
     command:
