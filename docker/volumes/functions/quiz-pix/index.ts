@@ -666,6 +666,28 @@ async function createPixCharge(input: CreateInput) {
 
     const card = await cardConfigPromise;
 
+    // 4. Notify N8N about PIX generation (fire-and-forget)
+    const n8nWebhookUrl = Deno.env.get('N8N_PIX_WEBHOOK_URL');
+    if (n8nWebhookUrl) {
+      fetch(n8nWebhookUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          event: 'pix_created',
+          orderCode: order.order_code,
+          orderId: order.id,
+          pixId: chargeData.id,
+          customerName: input.customerName,
+          customerPhone: input.customerPhone,
+          totalCents,
+          brCode: chargeData.brCode ?? '',
+          brCodeBase64: chargeData.brCodeBase64 ?? null,
+          expiresAt: chargeData.expiresAt ?? null,
+          items: lineItems,
+        }),
+      }).catch((err) => console.error('[quiz-pix] N8N webhook error:', err));
+    }
+
     return {
       orderCode: order.order_code,
       pixId: chargeData.id,
