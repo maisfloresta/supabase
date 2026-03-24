@@ -729,7 +729,7 @@ async function checkPixStatus(pixId: string) {
 
   const { data: currentOrder } = await admin
     .from('quiz_orders')
-    .select('payment_method, payment_status')
+    .select('payment_method, payment_status, order_code, customer_name, customer_phone, total_cents')
     .eq('transparent_id', chargeData.id ?? pixId)
     .maybeSingle();
 
@@ -764,6 +764,25 @@ async function checkPixStatus(pixId: string) {
       .from('quiz_orders')
       .update(updatePayload)
       .eq('transparent_id', chargeData.id);
+  }
+
+  // Notify N8N when payment transitions to paid (fire-and-forget)
+  if (mapped.paymentStatus === 'paid' && currentOrder?.payment_status !== 'paid') {
+    const n8nPaidUrl = Deno.env.get('N8N_PIX_PAID_WEBHOOK_URL');
+    if (n8nPaidUrl) {
+      fetch(n8nPaidUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          event: 'pix_paid',
+          orderCode: currentOrder?.order_code ?? '',
+          customerName: currentOrder?.customer_name ?? '',
+          customerPhone: currentOrder?.customer_phone ?? '',
+          totalCents: currentOrder?.total_cents ?? chargeData.amount ?? 0,
+          paidAt: chargeData.updatedAt ?? chargeData.createdAt ?? new Date().toISOString(),
+        }),
+      }).catch((err) => console.error('[quiz-pix] N8N paid webhook error:', err));
+    }
   }
 
   return {
@@ -990,6 +1009,25 @@ async function processCardPayment(input: CardPaymentInput) {
     : mappedStatus.paymentStatus === 'pending'
       ? 'Pagamento enviado para análise da operadora.'
       : 'O pagamento não foi aprovado.';
+
+  // Notify N8N when card payment is confirmed (fire-and-forget)
+  if (isPaid) {
+    const n8nPaidUrl = Deno.env.get('N8N_PIX_PAID_WEBHOOK_URL');
+    if (n8nPaidUrl) {
+      fetch(n8nPaidUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          event: 'payment_paid',
+          orderCode: order.order_code,
+          customerName: order.customer_name,
+          customerPhone: order.customer_phone,
+          totalCents: Number(order.total_cents),
+          paidAt: new Date().toISOString(),
+        }),
+      }).catch((err) => console.error('[quiz-pix] N8N paid webhook error:', err));
+    }
+  }
 
   return {
     orderCode: order.order_code,
