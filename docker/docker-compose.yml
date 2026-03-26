@@ -464,6 +464,7 @@ services:
       BOTCONVERSA_WEBHOOK_URL: ${BOTCONVERSA_WEBHOOK_URL}
       N8N_PIX_WEBHOOK_URL: ${N8N_PIX_WEBHOOK_URL}
       N8N_PIX_PAID_WEBHOOK_URL: ${N8N_PIX_PAID_WEBHOOK_URL}
+      ABACATEPAY_WEBHOOK_SECRET: ${ABACATEPAY_WEBHOOK_SECRET}
       # TODO: Allow configuring VERIFY_JWT per function. This PR might help: https://github.com/supabase/cli/pull/786
       VERIFY_JWT: "${FUNCTIONS_VERIFY_JWT}"
     command:
