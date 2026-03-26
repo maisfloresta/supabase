@@ -10,10 +10,53 @@ const CHECKOUT_EXPIRATION_SECONDS = 60 * 60; // 1 hour
 const FREIGHT_CENTS = 2500; // R$ 25,00
 const APPMAX_MAX_INSTALLMENTS = 12;
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-};
+const ALLOWED_ORIGINS = (Deno.env.get('ALLOWED_ORIGINS') ?? '').split(',').map(s => s.trim()).filter(Boolean);
+
+function getCorsHeaders(req: Request) {
+  const origin = req.headers.get('origin') ?? '';
+  const allowed = ALLOWED_ORIGINS.length === 0 || ALLOWED_ORIGINS.includes(origin);
+  return {
+    'Access-Control-Allow-Origin': allowed ? origin : ALLOWED_ORIGINS[0] ?? '',
+    'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+    'Vary': 'Origin',
+  };
+}
+
+// ── Rate limiter (per order code / per IP, per instance) ──
+const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
+const RATE_LIMIT_MAX = 5;
+const RATE_LIMIT_WINDOW_MS = 60_000;
+
+function isRateLimited(key: string): boolean {
+  const now = Date.now();
+  const entry = rateLimitMap.get(key);
+  if (!entry || now > entry.resetAt) {
+    rateLimitMap.set(key, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+    return false;
+  }
+  entry.count++;
+  return entry.count > RATE_LIMIT_MAX;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of rateLimitMap) {
+    if (now > entry.resetAt) rateLimitMap.delete(key);
+  }
+}, 60_000);
+
+// ── CPF validation (server-side) ──
+function isValidCpf(cpf: string): boolean {
+  const digits = cpf.replace(/\D/g, '');
+  if (digits.length !== 11 || /^(\d)\1{10}$/.test(digits)) return false;
+  for (let t = 9; t < 11; t++) {
+    let sum = 0;
+    for (let i = 0; i < t; i++) sum += Number(digits[i]) * (t + 1 - i);
+    const remainder = (sum * 10) % 11;
+    if ((remainder === 10 ? 0 : remainder) !== Number(digits[t])) return false;
+  }
+  return true;
+}
 
 function getEnv(name: string): string {
   const value = Deno.env.get(name);
@@ -25,10 +68,13 @@ function createAdminClient() {
   return createClient(getEnv('SUPABASE_URL'), getEnv('SUPABASE_SERVICE_ROLE_KEY'));
 }
 
+// Note: jsonResponse/errorResponse now accept cors parameter
+let _currentCors: Record<string, string> = {};
+
 function jsonResponse(payload: Record<string, unknown>, status = 200) {
   return new Response(JSON.stringify(payload), {
     status,
-    headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    headers: { ..._currentCors, 'Content-Type': 'application/json' },
   });
 }
 
@@ -1044,8 +1090,10 @@ async function processCardPayment(input: CardPaymentInput) {
 // ─── Handler ───
 
 Deno.serve(async (req) => {
+  _currentCors = getCorsHeaders(req);
+
   if (req.method === 'OPTIONS') {
-    return new Response('ok', { headers: corsHeaders });
+    return new Response(null, { status: 204, headers: _currentCors });
   }
 
   if (req.method !== 'POST') {
@@ -1057,24 +1105,48 @@ Deno.serve(async (req) => {
     const action = body.action;
 
     if (action === 'create') {
+      // Rate limit by CPF to prevent abuse
+      const cpfKey = digitsOnly(String(body.customerCpf ?? ''));
+      if (cpfKey && isRateLimited(`create:${cpfKey}`)) {
+        return errorResponse('Muitas tentativas. Aguarde um momento.', 429);
+      }
+
+      // Server-side CPF validation
+      const cpfDigits = digitsOnly(String(body.customerCpf ?? ''));
+      if (!isValidCpf(cpfDigits)) {
+        return errorResponse('CPF inválido.', 400);
+      }
+
+      // Validate phone
+      const phoneDigits = digitsOnly(String(body.customerPhone ?? ''));
+      if (phoneDigits.length < 10 || phoneDigits.length > 11) {
+        return errorResponse('Telefone inválido.', 400);
+      }
+
+      // Validate name
+      const customerName = String(body.customerName ?? '').trim();
+      if (customerName.length < 2 || customerName.length > 100) {
+        return errorResponse('Nome inválido.', 400);
+      }
+
       const shipping = (body.shipping ?? {}) as Record<string, unknown>;
       const data = await createPixCharge({
-        customerName: String(body.customerName ?? ''),
-        customerPhone: String(body.customerPhone ?? ''),
-        customerCpf: String(body.customerCpf ?? ''),
-        customerEmail: body.customerEmail ? String(body.customerEmail) : undefined,
-        customerRegion: body.customerRegion ? String(body.customerRegion) : undefined,
-        selectedColor: body.selectedColor ? String(body.selectedColor) : undefined,
+        customerName,
+        customerPhone: phoneDigits,
+        customerCpf: cpfDigits,
+        customerEmail: body.customerEmail ? String(body.customerEmail).trim().slice(0, 200) : undefined,
+        customerRegion: body.customerRegion ? String(body.customerRegion).trim().slice(0, 50) : undefined,
+        selectedColor: body.selectedColor ? String(body.selectedColor).trim().slice(0, 50) : undefined,
         quizAnswers: typeof body.quizAnswers === 'object' ? (body.quizAnswers as Record<string, unknown>) : undefined,
         cart: (body.cart ?? {}) as CartInput,
         shipping: {
-          cep: String(shipping.cep ?? ''),
-          street: String(shipping.street ?? ''),
-          number: String(shipping.number ?? ''),
-          complement: shipping.complement ? String(shipping.complement) : undefined,
-          neighborhood: String(shipping.neighborhood ?? ''),
-          city: String(shipping.city ?? ''),
-          state: String(shipping.state ?? ''),
+          cep: digitsOnly(String(shipping.cep ?? '')).slice(0, 8),
+          street: String(shipping.street ?? '').trim().slice(0, 200),
+          number: String(shipping.number ?? '').trim().slice(0, 20),
+          complement: shipping.complement ? String(shipping.complement).trim().slice(0, 100) : undefined,
+          neighborhood: String(shipping.neighborhood ?? '').trim().slice(0, 100),
+          city: String(shipping.city ?? '').trim().slice(0, 100),
+          state: String(shipping.state ?? '').trim().slice(0, 2),
         },
       });
       return jsonResponse({ success: true, data });
@@ -1082,20 +1154,32 @@ Deno.serve(async (req) => {
 
     if (action === 'status') {
       if (typeof body.pixId !== 'string' || !body.pixId.trim()) {
-        throw new Error('ID do PIX inválido.');
+        return errorResponse('ID do PIX inválido.', 400);
       }
-      const data = await checkPixStatus(body.pixId.trim());
+
+      // Rate limit status polling
+      const pixKey = body.pixId.trim().slice(0, 100);
+      if (isRateLimited(`status:${pixKey}`)) {
+        return errorResponse('Muitas consultas. Aguarde um momento.', 429);
+      }
+
+      const data = await checkPixStatus(pixKey);
       return jsonResponse({ success: true, data });
     }
 
     if (action === 'card') {
+      const orderCode = String(body.orderCode ?? '').trim();
+      if (orderCode && isRateLimited(`card:${orderCode}`)) {
+        return errorResponse('Muitas tentativas de pagamento. Aguarde um momento.', 429);
+      }
+
       const data = await processCardPayment({
-        orderCode: String(body.orderCode ?? ''),
+        orderCode,
         token: String(body.token ?? ''),
-        holderName: String(body.holderName ?? ''),
+        holderName: String(body.holderName ?? '').trim().slice(0, 100),
         holderDocumentNumber: String(body.holderDocumentNumber ?? ''),
         installments: Number(body.installments ?? 0),
-        customerIp: body.customerIp ? String(body.customerIp) : undefined,
+        customerIp: body.customerIp ? String(body.customerIp).trim().slice(0, 45) : undefined,
       });
       return jsonResponse({ success: true, data });
     }
@@ -1103,11 +1187,29 @@ Deno.serve(async (req) => {
     return errorResponse('Ação inválida.', 400);
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Erro inesperado.';
-    const status = message.includes('Variável de ambiente') ||
-        message.includes('Falha ao comunicar') ||
-        message.includes('Não foi possível consultar a instalação Appmax')
-      ? 500
-      : 400;
-    return errorResponse(message, status);
+    // Don't expose internal infrastructure details to the client
+    const safeMessages = [
+      'Nenhum item selecionado.',
+      'Endereço de envio incompleto.',
+      'CPF inválido.',
+      'Telefone inválido.',
+      'Nome inválido.',
+      'Pedido inválido.',
+      'Token do cartão inválido.',
+      'Nome do titular é obrigatório.',
+      'CPF do titular inválido.',
+      'Parcelamento inválido.',
+      'Pedido não encontrado.',
+      'Pedido sem itens.',
+      'Pagamento já confirmado.',
+      'Resposta inválida ao gerar o pagamento.',
+      'Resposta inválida ao consultar o pagamento.',
+      'O pagamento não foi aprovado.',
+      'O cartão está temporariamente indisponível. Tente novamente em instantes.',
+    ];
+    const isSafe = safeMessages.some(m => message.includes(m));
+    const clientMessage = isSafe ? message : 'Erro ao processar a solicitação. Tente novamente.';
+    if (!isSafe) console.error('[quiz-pix] Unhandled error:', message);
+    return errorResponse(clientMessage, isSafe ? 400 : 500);
   }
 });

@@ -465,6 +465,9 @@ services:
       N8N_PIX_WEBHOOK_URL: ${N8N_PIX_WEBHOOK_URL}
       N8N_PIX_PAID_WEBHOOK_URL: ${N8N_PIX_PAID_WEBHOOK_URL}
       ABACATEPAY_WEBHOOK_SECRET: ${ABACATEPAY_WEBHOOK_SECRET}
+      FB_ACCESS_TOKEN: ${FB_ACCESS_TOKEN}
+      FB_PIXEL_ID: ${FB_PIXEL_ID}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
       # TODO: Allow configuring VERIFY_JWT per function. This PR might help: https://github.com/supabase/cli/pull/786
       VERIFY_JWT: "${FUNCTIONS_VERIFY_JWT}"
     command:
