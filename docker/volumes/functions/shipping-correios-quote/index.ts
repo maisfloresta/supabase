@@ -32,10 +32,11 @@ async function runPackagingEngine(
 
     if (rules.length === 0) return null
 
-    // Step 1: SKU Fixed
-    const skuFixedRules = rules.filter((r: Record<string, unknown>) => r.rule_type === 'sku_fixed' && r.match_sku)
+    // Step 1: SKU Fixed (match_skus is a JSON array)
+    const skuFixedRules = rules.filter((r: Record<string, unknown>) => r.rule_type === 'sku_fixed' && Array.isArray(r.match_skus) && (r.match_skus as string[]).length > 0)
     for (const rule of skuFixedRules) {
-      if (items.some(item => item.sku === rule.match_sku)) {
+      const skus = (rule.match_skus ?? []) as string[]
+      if (items.some(item => item.sku && skus.includes(item.sku))) {
         return { height_cm: Number(rule.height_cm), width_cm: Number(rule.width_cm), length_cm: Number(rule.length_cm), weight_grams: rule.weight_grams_override as number | null }
       }
     }

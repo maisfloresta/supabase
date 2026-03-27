@@ -42,7 +42,7 @@ interface PackagingRule {
   name: string
   rule_type: string
   priority: number
-  match_sku: string | null
+  match_skus: string[]
   match_category_id: number | null
   match_category_ids: number[]
   height_cm: number
@@ -101,13 +101,16 @@ export function runEngine(
   const catById = new Map(categories.map(c => [c.id, c]))
 
   // ── Step 1: SKU Fixed ──
-  const skuFixedRules = rules.filter(r => r.rule_type === 'sku_fixed' && r.match_sku)
+  const skuFixedRules = rules.filter(r => r.rule_type === 'sku_fixed' && (r.match_skus ?? []).length > 0)
   let skuMatch: PackagingRule | null = null
+  let matchedSku = ''
 
   for (const rule of skuFixedRules) {
-    const found = items.some(item => item.sku === rule.match_sku)
+    const skus = (rule.match_skus ?? []) as string[]
+    const found = items.find(item => item.sku && skus.includes(item.sku))
     if (found) {
       skuMatch = rule
+      matchedSku = found.sku!
       break
     }
   }
@@ -116,7 +119,7 @@ export function runEngine(
     evaluation.push({
       step: 'sku_fixed',
       matched: true,
-      detail: `SKU "${skuMatch.match_sku}" encontrado → regra "${skuMatch.name}" (${skuMatch.height_cm}x${skuMatch.width_cm}x${skuMatch.length_cm})`,
+      detail: `SKU "${matchedSku}" encontrado → regra "${skuMatch.name}" (${skuMatch.height_cm}x${skuMatch.width_cm}x${skuMatch.length_cm})`,
     })
     return {
       dimensions: {
