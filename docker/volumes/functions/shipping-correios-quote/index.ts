@@ -7,6 +7,79 @@ const internalWebhookToken = Deno.env.get('WEBHOOK_SHARED_TOKEN') ?? ''
 
 const CORREIOS_BASE = 'https://api.correios.com.br'
 
+// ─── Packaging Rules Engine (inline) ────────────────────────────────────────
+
+interface PkgDimensions { height_cm: number; width_cm: number; length_cm: number; weight_grams: number | null }
+
+async function runPackagingEngine(
+  supabase: ReturnType<typeof createClient>,
+  order: Record<string, unknown>,
+): Promise<PkgDimensions | null> {
+  try {
+    const items = (order.items ?? []) as Array<{ sku: string | null; name: string; qty: number }>
+
+    const [rulesRes, catsRes, mapsRes, contRes] = await Promise.all([
+      supabase.schema('shipping').from('packaging_rules').select('*').eq('active', true).order('priority', { ascending: true }),
+      supabase.schema('shipping').from('product_categories').select('*').eq('active', true),
+      supabase.schema('shipping').from('product_category_map').select('sku, category_id'),
+      supabase.schema('shipping').from('packaging_containment').select('container_category_id, contained_category_id, max_qty').eq('active', true),
+    ])
+
+    const rules = rulesRes.data ?? []
+    const categories = catsRes.data ?? []
+    const categoryMaps = mapsRes.data ?? []
+    const containments = contRes.data ?? []
+
+    if (rules.length === 0) return null
+
+    // Step 1: SKU Fixed
+    const skuFixedRules = rules.filter((r: Record<string, unknown>) => r.rule_type === 'sku_fixed' && r.match_sku)
+    for (const rule of skuFixedRules) {
+      if (items.some(item => item.sku === rule.match_sku)) {
+        return { height_cm: Number(rule.height_cm), width_cm: Number(rule.width_cm), length_cm: Number(rule.length_cm), weight_grams: rule.weight_grams_override as number | null }
+      }
+    }
+
+    // Step 2: Classify items
+    const skuToCats = new Map<string, number[]>()
+    for (const m of categoryMaps) { const e = skuToCats.get(m.sku) ?? []; e.push(m.category_id); skuToCats.set(m.sku, e) }
+    const orderCatIds = new Set<number>()
+    for (const item of items) { if (item.sku) { (skuToCats.get(item.sku) ?? []).forEach(c => orderCatIds.add(c)) } }
+
+    // Step 3: Combination rules
+    for (const rule of rules.filter((r: Record<string, unknown>) => r.rule_type === 'combination')) {
+      const reqIds = (rule.match_category_ids ?? []) as number[]
+      if (reqIds.length > 0 && reqIds.every((id: number) => orderCatIds.has(id))) {
+        return { height_cm: Number(rule.height_cm), width_cm: Number(rule.width_cm), length_cm: Number(rule.length_cm), weight_grams: rule.weight_grams_override as number | null }
+      }
+    }
+
+    // Step 4: Category base + containment
+    const catBaseRules = rules.filter((r: Record<string, unknown>) => r.rule_type === 'category_base' && r.match_category_id)
+    const applicable = catBaseRules.filter((r: Record<string, unknown>) => orderCatIds.has(r.match_category_id as number))
+    if (applicable.length > 0) {
+      const containedIds = new Set<number>()
+      for (const c of containments) {
+        if (orderCatIds.has(c.container_category_id) && orderCatIds.has(c.contained_category_id)) containedIds.add(c.contained_category_id)
+      }
+      const effective = applicable.filter((r: Record<string, unknown>) => !containedIds.has(r.match_category_id as number))
+      const best = effective.length > 0 ? effective[0] : applicable[0]
+      return { height_cm: Number(best.height_cm), width_cm: Number(best.width_cm), length_cm: Number(best.length_cm), weight_grams: best.weight_grams_override as number | null }
+    }
+
+    // Step 5: Fallback
+    const fallback = rules.find((r: Record<string, unknown>) => r.rule_type === 'fallback')
+    if (fallback) {
+      return { height_cm: Number(fallback.height_cm), width_cm: Number(fallback.width_cm), length_cm: Number(fallback.length_cm), weight_grams: fallback.weight_grams_override as number | null }
+    }
+
+    return null
+  } catch (e) {
+    console.error('Packaging engine error (non-fatal):', e instanceof Error ? e.message : String(e))
+    return null
+  }
+}
+
 // Token cache (Correios tokens last ~1h, we refresh at 50 min)
 let cachedToken: string | null = null
 let tokenExpiresAt = 0
@@ -315,6 +388,30 @@ async function handleQuoteOrder(supabase: ReturnType<typeof createClient>, body:
     return jsonResponse({ success: false, error: `Order not found: ${orderErr?.message ?? 'null'}` }, 404)
   }
 
+  // ── Packaging Rules Engine: recalculate dimensions ──
+  const engineResult = await runPackagingEngine(supabase, order)
+
+  let pkgHeight = Number(order.package_height_cm) || 2
+  let pkgWidth = Number(order.package_width_cm) || 11
+  let pkgLength = Number(order.package_length_cm) || 16
+  let pkgWeight = order.package_weight_grams || 300
+
+  if (engineResult) {
+    pkgHeight = engineResult.height_cm
+    pkgWidth = engineResult.width_cm
+    pkgLength = engineResult.length_cm
+    if (engineResult.weight_grams !== null) pkgWeight = engineResult.weight_grams
+
+    // Update order with recalculated dimensions
+    const updateData: Record<string, unknown> = {
+      package_height_cm: pkgHeight,
+      package_width_cm: pkgWidth,
+      package_length_cm: pkgLength,
+    }
+    if (engineResult.weight_grams !== null) updateData.package_weight_grams = pkgWeight
+    await supabase.schema('shipping').from('unified_orders').update(updateData).eq('id', order.id)
+  }
+
   // Get sender ZIP
   const { data: senderSetting } = await supabase
     .schema('shipping')
@@ -329,7 +426,7 @@ async function handleQuoteOrder(supabase: ReturnType<typeof createClient>, body:
   const token = await getCorreiosToken(creds)
 
   // Convert weight from grams to kg
-  const pesoKg = (order.package_weight_grams || 300) / 1000
+  const pesoKg = pkgWeight / 1000
   // Valor declarado from total_cents to R$
   const valorDeclarado = (order.total_cents || 0) / 100
 
@@ -337,9 +434,9 @@ async function handleQuoteOrder(supabase: ReturnType<typeof createClient>, body:
     cepOrigem: senderZip,
     cepDestino: String(order.shipping_zip).replace(/\D/g, ''),
     peso: pesoKg,
-    comprimento: Number(order.package_length_cm) || 16,
-    largura: Number(order.package_width_cm) || 11,
-    altura: Number(order.package_height_cm) || 2,
+    comprimento: pkgLength,
+    largura: pkgWidth,
+    altura: pkgHeight,
     valorDeclarado: valorDeclarado > 0 ? valorDeclarado : undefined,
   })
 
