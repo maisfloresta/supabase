@@ -415,7 +415,10 @@ function validateAndCalculateCart(cart: CartInput) {
 // ─── AbacatePay API ───
 
 async function abacatePayRequest(path: string, init: RequestInit, useV1Key = false) {
-  const apiKey = useV1Key ? getEnv('ABACATEPAY_API_KEY_V1') : getEnv('ABACATEPAY_API_KEY');
+  const preferV1Key = useV1Key || path.startsWith('/v1/');
+  const apiKey = preferV1Key
+    ? Deno.env.get('ABACATEPAY_API_KEY_V1') || getEnv('ABACATEPAY_API_KEY')
+    : getEnv('ABACATEPAY_API_KEY');
   const response = await fetch(`${ABACATEPAY_API_URL}${path}`, {
     ...init,
     headers: {

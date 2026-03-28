@@ -176,7 +176,9 @@ export function extractAbacatePayError(payload: Record<string, unknown> | null, 
 }
 
 export async function abacatePayRequest(path: string, init: RequestInit) {
-  const apiKey = getRequiredEnv('ABACATEPAY_API_KEY');
+  const apiKey = path.startsWith('/v1/')
+    ? getFirstAvailableEnv(['ABACATEPAY_API_KEY_V1', 'ABACATEPAY_API_KEY'])
+    : getRequiredEnv('ABACATEPAY_API_KEY');
 
   const response = await fetch(`${ABACATEPAY_API_URL}${path}`, {
     ...init,
