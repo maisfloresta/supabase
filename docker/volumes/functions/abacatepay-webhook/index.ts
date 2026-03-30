@@ -20,12 +20,90 @@ function createAdminClient() {
   return createClient(url, key);
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function firstString(candidates: unknown[]) {
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+
+  return null;
+}
+
+function firstNumber(candidates: unknown[]) {
+  for (const candidate of candidates) {
+    if (typeof candidate === 'number' && Number.isFinite(candidate)) {
+      return candidate;
+    }
+
+    if (typeof candidate === 'string' && candidate.trim()) {
+      const parsed = Number(candidate.replace(',', '.'));
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+  }
+
+  return null;
+}
+
+function extractWebhookData(payload: Record<string, unknown>) {
+  const data = isRecord(payload.data) ? payload.data : {};
+  const transparent = isRecord(data.transparent) ? data.transparent : data;
+  const metadata = isRecord(transparent.metadata)
+    ? transparent.metadata
+    : isRecord(data.metadata)
+      ? data.metadata
+      : {};
+
+  return {
+    event: firstString([payload.event, payload.type, data.event, data.type]) ?? '',
+    rawData: data,
+    transparent,
+    metadata,
+    transparentId: firstString([
+      transparent.id,
+      transparent.externalId,
+      data.id,
+      data.pixId,
+      data.transparent_id,
+    ]),
+    status: firstString([transparent.status, data.status]),
+    amount: firstNumber([
+      transparent.amount,
+      transparent.paidAmount,
+      data.amount,
+      data.paidAmount,
+    ]),
+    paidAmount: firstNumber([
+      transparent.paidAmount,
+      data.paidAmount,
+      transparent.amount,
+      data.amount,
+    ]),
+    paidAt: firstString([
+      transparent.updatedAt,
+      data.updatedAt,
+      transparent.createdAt,
+      data.createdAt,
+    ]),
+    receiptUrl: firstString([transparent.receiptUrl, data.receiptUrl]),
+  };
+}
+
 function mapEventToStatus(event: string) {
   switch (event) {
     case 'transparent.completed': return { paymentStatus: 'paid', orderStatus: 'paid' };
+    case 'transparent.paid': return { paymentStatus: 'paid', orderStatus: 'paid' };
     case 'transparent.refunded': return { paymentStatus: 'refunded', orderStatus: 'refunded' };
     case 'transparent.disputed': return { paymentStatus: 'disputed', orderStatus: 'disputed' };
     case 'transparent.lost': return { paymentStatus: 'expired', orderStatus: 'expired' };
+    case 'transparent.expired': return { paymentStatus: 'expired', orderStatus: 'expired' };
+    case 'transparent.cancelled': return { paymentStatus: 'cancelled', orderStatus: 'cancelled' };
     default: return null;
   }
 }
@@ -67,53 +145,100 @@ Deno.serve(async (req) => {
     const body = JSON.parse(rawBody);
     console.log('[abacatepay-webhook] Received:', JSON.stringify(body));
 
-    // AbacatePay sends: { event: "transparent.completed", data: { id, status, amount, ... } }
-    const event = body.event ?? body.type ?? '';
-    const data = body.data ?? body;
-    const transparentId = data.id ?? data.pixId ?? data.transparent_id ?? '';
+    const parsed = extractWebhookData(isRecord(body) ? body : {});
+    const event = parsed.event;
+    const transparentId = parsed.transparentId;
+    const metadataQuizOrderId = firstNumber([parsed.metadata.quizOrderId]);
+    const metadataQuizOrderCode = firstString([parsed.metadata.quizOrderCode]);
 
-    if (!transparentId) {
-      console.error('[abacatepay-webhook] No transparent ID found in payload');
+    if (!transparentId && !metadataQuizOrderId && !metadataQuizOrderCode) {
+      console.error('[abacatepay-webhook] No order identifier found in payload');
       return jsonResponse({ success: true, message: 'No ID to process' });
     }
 
-    // Map from event name first, fallback to data.status
-    const mapped = mapEventToStatus(event) ?? mapStatus(data.status);
+    const mapped = mapEventToStatus(event) ?? mapStatus(parsed.status);
 
     if (!mapped) {
       console.log(`[abacatepay-webhook] Ignoring unknown event: ${event}`);
       return jsonResponse({ success: true, message: 'Event ignored' });
     }
+
     const admin = createAdminClient();
 
-    // Get current order
-    const { data: order } = await admin
-      .from('quiz_orders')
-      .select('id, order_code, payment_status, customer_name, customer_phone, total_cents, provider_response')
-      .eq('transparent_id', transparentId)
-      .maybeSingle();
+    let order:
+      | {
+        id: number;
+        order_code: string;
+        transparent_id: string | null;
+        payment_status: string | null;
+        customer_name: string | null;
+        customer_phone: string | null;
+        total_cents: number | null;
+        provider_response: Record<string, unknown> | null;
+      }
+      | null = null;
+
+    if (transparentId) {
+      const lookup = await admin
+        .from('quiz_orders')
+        .select('id, order_code, transparent_id, payment_status, customer_name, customer_phone, total_cents, provider_response')
+        .eq('transparent_id', transparentId)
+        .maybeSingle();
+      order = lookup.data;
+    }
+
+    if (!order && metadataQuizOrderId !== null) {
+      const lookup = await admin
+        .from('quiz_orders')
+        .select('id, order_code, transparent_id, payment_status, customer_name, customer_phone, total_cents, provider_response')
+        .eq('id', metadataQuizOrderId)
+        .maybeSingle();
+      order = lookup.data;
+    }
+
+    if (!order && metadataQuizOrderCode) {
+      const lookup = await admin
+        .from('quiz_orders')
+        .select('id, order_code, transparent_id, payment_status, customer_name, customer_phone, total_cents, provider_response')
+        .eq('order_code', metadataQuizOrderCode)
+        .maybeSingle();
+      order = lookup.data;
+    }
 
     if (!order) {
-      console.log(`[abacatepay-webhook] No order found for transparent_id=${transparentId}`);
+      console.log(`[abacatepay-webhook] No order found for transparent_id=${transparentId ?? 'missing'} order_code=${metadataQuizOrderCode ?? 'missing'} order_id=${metadataQuizOrderId ?? 'missing'}`);
       return jsonResponse({ success: true, message: 'Order not found' });
     }
 
     const wasPaid = order.payment_status === 'paid';
 
-    // Build update payload
+    const existingProviderResponse = isRecord(order.provider_response) ? order.provider_response : {};
+    const existingAbacatePay = isRecord(existingProviderResponse.abacatepay)
+      ? existingProviderResponse.abacatepay
+      : {};
+
+    const latestAbacatepaySnapshot = {
+      ...existingAbacatePay,
+      ...parsed.transparent,
+      metadata: Object.keys(parsed.metadata).length > 0 ? parsed.metadata : existingAbacatePay.metadata ?? null,
+    };
+
     const updatePayload: Record<string, unknown> = {
       payment_status: mapped.paymentStatus,
       order_status: mapped.orderStatus,
+      transparent_id: transparentId ?? order.transparent_id,
+      last_webhook_payload: body,
       provider_response: {
-        ...(typeof order.provider_response === 'object' && order.provider_response !== null ? order.provider_response : {}),
-        abacatepay_webhook: data,
+        ...existingProviderResponse,
+        abacatepay: latestAbacatepaySnapshot,
+        abacatepay_webhook: body,
       },
     };
 
     if (mapped.paymentStatus === 'paid') {
-      updatePayload.paid_amount_cents = data.amount ?? data.paidAmount ?? order.total_cents;
-      updatePayload.paid_at = data.updatedAt ?? data.createdAt ?? new Date().toISOString();
-      updatePayload.receipt_url = data.receiptUrl ?? null;
+      updatePayload.paid_amount_cents = parsed.paidAmount ?? parsed.amount ?? order.total_cents;
+      updatePayload.paid_at = parsed.paidAt ?? new Date().toISOString();
+      updatePayload.receipt_url = parsed.receiptUrl ?? null;
     }
 
     await admin
@@ -123,7 +248,6 @@ Deno.serve(async (req) => {
 
     console.log(`[abacatepay-webhook] Order ${order.order_code} updated: ${order.payment_status} -> ${mapped.paymentStatus}`);
 
-    // Notify N8N when payment transitions to paid
     if (mapped.paymentStatus === 'paid' && !wasPaid) {
       const n8nPaidUrl = Deno.env.get('N8N_PIX_PAID_WEBHOOK_URL');
       if (n8nPaidUrl) {
@@ -136,7 +260,7 @@ Deno.serve(async (req) => {
             customerName: order.customer_name,
             customerPhone: order.customer_phone,
             totalCents: order.total_cents,
-            paidAt: updatePayload.paid_at ?? new Date().toISOString(),
+            paidAt: String(updatePayload.paid_at ?? new Date().toISOString()),
           }),
         }).catch((err) => console.error('[abacatepay-webhook] N8N error:', err));
       }
