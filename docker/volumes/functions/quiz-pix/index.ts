@@ -1,5 +1,13 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import { decryptSecret } from '../_shared/appmax.ts';
+import {
+  extractStoredMetaPurchaseStatus,
+  extractStoredMetaTracking,
+  mergeStoredMetaPurchaseStatus,
+  mergeStoredMetaTracking,
+  sendMetaPurchaseEvent,
+  type MetaTrackingRecord,
+} from '../_shared/meta.ts';
 
 const ABACATEPAY_API_URL = 'https://api.abacatepay.com';
 const APPMAX_API_URL = Deno.env.get('APPMAX_API_URL') ?? 'https://api.appmax.com.br';
@@ -609,6 +617,7 @@ interface CreateInput {
   quizAnswers?: Record<string, unknown>;
   cart: CartInput;
   shipping: ShippingAddress;
+  tracking?: MetaTrackingRecord;
 }
 
 interface CardPaymentInput {
@@ -620,7 +629,102 @@ interface CardPaymentInput {
   customerIp?: string;
 }
 
-async function createPixCharge(input: CreateInput) {
+interface RequestContext {
+  clientIp?: string;
+  userAgent?: string;
+}
+
+interface PaidOrderSnapshot {
+  id: number;
+  order_code: string;
+  customer_name?: string | null;
+  customer_phone?: string | null;
+  customer_cpf?: string | null;
+  total_cents?: number | null;
+  shipping_cep?: string | null;
+  shipping_city?: string | null;
+  shipping_state?: string | null;
+  provider_response?: unknown;
+}
+
+function extractClientIp(req: Request) {
+  const forwardedFor = req.headers.get('cf-connecting-ip')
+    ?? req.headers.get('x-real-ip')
+    ?? req.headers.get('x-forwarded-for')
+    ?? '';
+
+  return firstString([forwardedFor.split(',')[0]]) ?? undefined;
+}
+
+function extractRequestContext(req: Request): RequestContext {
+  return {
+    clientIp: extractClientIp(req),
+    userAgent: firstString([req.headers.get('user-agent')]) ?? undefined,
+  };
+}
+
+async function syncMetaPurchaseForOrder(
+  admin: ReturnType<typeof createAdminClient>,
+  order: PaidOrderSnapshot,
+  eventTime?: string | null,
+) {
+  const existingMeta = extractStoredMetaPurchaseStatus(order.provider_response);
+  if (existingMeta.purchaseSentAt) {
+    return;
+  }
+
+  const tracking = extractStoredMetaTracking(order.provider_response);
+  const eventId = existingMeta.purchaseEventId ?? `purchase_${order.order_code}`;
+
+  try {
+    const result = await sendMetaPurchaseEvent({
+      orderCode: order.order_code,
+      totalCents: Number(order.total_cents ?? 0),
+      eventTime,
+      customerName: order.customer_name ?? undefined,
+      customerPhone: order.customer_phone ?? undefined,
+      customerEmail: tracking.customerEmail ?? undefined,
+      customerCpf: order.customer_cpf ?? undefined,
+      shippingCity: order.shipping_city ?? undefined,
+      shippingState: order.shipping_state ?? undefined,
+      shippingZip: order.shipping_cep ?? undefined,
+      eventSourceUrl: tracking.pageUrl ?? undefined,
+      clientIpAddress: tracking.clientIp ?? undefined,
+      clientUserAgent: tracking.userAgent ?? undefined,
+      fbp: tracking.fbp ?? undefined,
+      fbc: tracking.fbc ?? undefined,
+    });
+
+    await admin
+      .from('quiz_orders')
+      .update({
+        provider_response: mergeStoredMetaPurchaseStatus(order.provider_response, {
+          purchaseEventId: result.eventId,
+          purchaseSentAt: result.sent ? new Date().toISOString() : null,
+          purchaseLastError: null,
+          purchaseLastResponse: result.response ?? null,
+          purchaseSkippedReason: result.skippedReason ?? null,
+        }),
+      })
+      .eq('id', order.id);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Meta conversion failed.';
+    console.error('[quiz-pix] Meta purchase sync failed:', message);
+
+    await admin
+      .from('quiz_orders')
+      .update({
+        provider_response: mergeStoredMetaPurchaseStatus(order.provider_response, {
+          purchaseEventId: eventId,
+          purchaseSentAt: null,
+          purchaseLastError: message,
+        }),
+      })
+      .eq('id', order.id);
+  }
+}
+
+async function createPixCharge(input: CreateInput, requestContext: RequestContext) {
   const admin = createAdminClient();
   const { lineItems, subtotalCents, totalCents, freightCents, hasGift, freeShipping } = validateAndCalculateCart(input.cart);
   const orderCode = buildOrderCode();
@@ -654,8 +758,14 @@ async function createPixCharge(input: CreateInput) {
       shipping_neighborhood: s.neighborhood,
       shipping_city: s.city,
       shipping_state: s.state,
+      provider_response: mergeStoredMetaTracking(null, {
+        ...(input.tracking ?? {}),
+        customerEmail: input.customerEmail ?? null,
+        userAgent: requestContext.userAgent ?? input.tracking?.userAgent ?? null,
+        clientIp: requestContext.clientIp ?? input.tracking?.clientIp ?? null,
+      }),
     })
-    .select('id, order_code')
+    .select('id, order_code, provider_response')
     .single();
 
   if (orderError || !order) {
@@ -706,9 +816,9 @@ async function createPixCharge(input: CreateInput) {
         payment_status: mapped.paymentStatus,
         order_status: mapped.orderStatus,
         dev_mode: Boolean(chargeData.devMode),
-        provider_response: {
+        provider_response: mergeProviderResponse(order.provider_response, {
           abacatepay: chargeData,
-        },
+        }),
         expires_at: chargeData.expiresAt ?? null,
       })
       .eq('order_code', orderCode);
@@ -778,7 +888,7 @@ async function checkPixStatus(pixId: string) {
 
   const { data: currentOrder } = await admin
     .from('quiz_orders')
-    .select('payment_method, payment_status, order_code, customer_name, customer_phone, total_cents')
+    .select('id, payment_method, payment_status, order_code, customer_name, customer_phone, customer_cpf, total_cents, shipping_cep, shipping_city, shipping_state, provider_response')
     .eq('transparent_id', chargeData.id ?? pixId)
     .maybeSingle();
 
@@ -792,14 +902,15 @@ async function checkPixStatus(pixId: string) {
   }
 
   const mapped = mapStatus(chargeData.status);
+  const mergedProviderResponse = mergeProviderResponse(currentOrder?.provider_response, {
+    abacatepay: chargeData,
+  });
 
   const updatePayload: Record<string, unknown> = {
     payment_status: mapped.paymentStatus,
     order_status: mapped.orderStatus,
     dev_mode: Boolean(chargeData.devMode),
-    provider_response: {
-      abacatepay: chargeData,
-    },
+    provider_response: mergedProviderResponse,
   };
 
   if (mapped.paymentStatus === 'paid') {
@@ -816,7 +927,20 @@ async function checkPixStatus(pixId: string) {
   }
 
   // Notify N8N when payment transitions to paid (fire-and-forget)
-  if (mapped.paymentStatus === 'paid' && currentOrder?.payment_status !== 'paid') {
+  if (mapped.paymentStatus === 'paid' && currentOrder && currentOrder.payment_status !== 'paid') {
+    await syncMetaPurchaseForOrder(admin, {
+      id: currentOrder.id,
+      order_code: currentOrder.order_code,
+      customer_name: currentOrder.customer_name,
+      customer_phone: currentOrder.customer_phone,
+      customer_cpf: currentOrder.customer_cpf,
+      total_cents: currentOrder.total_cents,
+      shipping_cep: currentOrder.shipping_cep,
+      shipping_city: currentOrder.shipping_city,
+      shipping_state: currentOrder.shipping_state,
+      provider_response: mergedProviderResponse,
+    }, chargeData.updatedAt ?? chargeData.createdAt ?? new Date().toISOString());
+
     const n8nPaidUrl = Deno.env.get('N8N_PIX_PAID_WEBHOOK_URL');
     if (n8nPaidUrl) {
       fetch(n8nPaidUrl, {
@@ -1061,6 +1185,19 @@ async function processCardPayment(input: CardPaymentInput) {
 
   // Notify N8N when card payment is confirmed (fire-and-forget)
   if (isPaid) {
+    await syncMetaPurchaseForOrder(admin, {
+      id: order.id,
+      order_code: order.order_code,
+      customer_name: order.customer_name,
+      customer_phone: order.customer_phone,
+      customer_cpf: order.customer_cpf,
+      total_cents: Number(order.total_cents),
+      shipping_cep: order.shipping_cep,
+      shipping_city: order.shipping_city,
+      shipping_state: order.shipping_state,
+      provider_response: providerResponse,
+    }, new Date().toISOString());
+
     const n8nPaidUrl = Deno.env.get('N8N_PIX_PAID_WEBHOOK_URL');
     if (n8nPaidUrl) {
       fetch(n8nPaidUrl, {
@@ -1133,6 +1270,7 @@ Deno.serve(async (req) => {
       }
 
       const shipping = (body.shipping ?? {}) as Record<string, unknown>;
+      const tracking = isRecord(body.tracking) ? body.tracking : {};
       const data = await createPixCharge({
         customerName,
         customerPhone: phoneDigits,
@@ -1141,6 +1279,15 @@ Deno.serve(async (req) => {
         customerRegion: body.customerRegion ? String(body.customerRegion).trim().slice(0, 50) : undefined,
         selectedColor: body.selectedColor ? String(body.selectedColor).trim().slice(0, 50) : undefined,
         quizAnswers: typeof body.quizAnswers === 'object' ? (body.quizAnswers as Record<string, unknown>) : undefined,
+        tracking: isRecord(body.tracking)
+          ? {
+            fbp: tracking.fbp ? String(tracking.fbp).trim().slice(0, 255) : undefined,
+            fbc: tracking.fbc ? String(tracking.fbc).trim().slice(0, 255) : undefined,
+            fbclid: tracking.fbclid ? String(tracking.fbclid).trim().slice(0, 255) : undefined,
+            pageUrl: tracking.pageUrl ? String(tracking.pageUrl).trim().slice(0, 2000) : undefined,
+            referrer: tracking.referrer ? String(tracking.referrer).trim().slice(0, 2000) : undefined,
+          }
+          : undefined,
         cart: (body.cart ?? {}) as CartInput,
         shipping: {
           cep: digitsOnly(String(shipping.cep ?? '')).slice(0, 8),
@@ -1151,7 +1298,7 @@ Deno.serve(async (req) => {
           city: String(shipping.city ?? '').trim().slice(0, 100),
           state: String(shipping.state ?? '').trim().slice(0, 2),
         },
-      });
+      }, extractRequestContext(req));
       return jsonResponse({ success: true, data });
     }
 

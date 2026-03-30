@@ -1,5 +1,11 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import { hmac } from 'https://deno.land/x/hmac@v2.0.1/mod.ts';
+import {
+  extractStoredMetaPurchaseStatus,
+  extractStoredMetaTracking,
+  mergeStoredMetaPurchaseStatus,
+  sendMetaPurchaseEvent,
+} from '../_shared/meta.ts';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -173,7 +179,11 @@ Deno.serve(async (req) => {
         payment_status: string | null;
         customer_name: string | null;
         customer_phone: string | null;
+        customer_cpf: string | null;
         total_cents: number | null;
+        shipping_cep: string | null;
+        shipping_city: string | null;
+        shipping_state: string | null;
         provider_response: Record<string, unknown> | null;
       }
       | null = null;
@@ -181,7 +191,7 @@ Deno.serve(async (req) => {
     if (transparentId) {
       const lookup = await admin
         .from('quiz_orders')
-        .select('id, order_code, transparent_id, payment_status, customer_name, customer_phone, total_cents, provider_response')
+        .select('id, order_code, transparent_id, payment_status, customer_name, customer_phone, customer_cpf, total_cents, shipping_cep, shipping_city, shipping_state, provider_response')
         .eq('transparent_id', transparentId)
         .maybeSingle();
       order = lookup.data;
@@ -190,7 +200,7 @@ Deno.serve(async (req) => {
     if (!order && metadataQuizOrderId !== null) {
       const lookup = await admin
         .from('quiz_orders')
-        .select('id, order_code, transparent_id, payment_status, customer_name, customer_phone, total_cents, provider_response')
+        .select('id, order_code, transparent_id, payment_status, customer_name, customer_phone, customer_cpf, total_cents, shipping_cep, shipping_city, shipping_state, provider_response')
         .eq('id', metadataQuizOrderId)
         .maybeSingle();
       order = lookup.data;
@@ -199,7 +209,7 @@ Deno.serve(async (req) => {
     if (!order && metadataQuizOrderCode) {
       const lookup = await admin
         .from('quiz_orders')
-        .select('id, order_code, transparent_id, payment_status, customer_name, customer_phone, total_cents, provider_response')
+        .select('id, order_code, transparent_id, payment_status, customer_name, customer_phone, customer_cpf, total_cents, shipping_cep, shipping_city, shipping_state, provider_response')
         .eq('order_code', metadataQuizOrderCode)
         .maybeSingle();
       order = lookup.data;
@@ -249,6 +259,68 @@ Deno.serve(async (req) => {
     console.log(`[abacatepay-webhook] Order ${order.order_code} updated: ${order.payment_status} -> ${mapped.paymentStatus}`);
 
     if (mapped.paymentStatus === 'paid' && !wasPaid) {
+      const existingMeta = extractStoredMetaPurchaseStatus(order.provider_response);
+
+      if (!existingMeta.purchaseSentAt) {
+        const tracking = extractStoredMetaTracking(order.provider_response);
+        const eventId = existingMeta.purchaseEventId ?? `purchase_${order.order_code}`;
+
+        try {
+          const metaResult = await sendMetaPurchaseEvent({
+            orderCode: order.order_code,
+            totalCents: Number(order.total_cents ?? 0),
+            eventTime: String(updatePayload.paid_at ?? new Date().toISOString()),
+            customerName: order.customer_name ?? undefined,
+            customerPhone: order.customer_phone ?? undefined,
+            customerEmail: tracking.customerEmail ?? undefined,
+            customerCpf: order.customer_cpf ?? undefined,
+            shippingZip: order.shipping_cep ?? undefined,
+            shippingCity: order.shipping_city ?? undefined,
+            shippingState: order.shipping_state ?? undefined,
+            eventSourceUrl: tracking.pageUrl ?? undefined,
+            clientIpAddress: tracking.clientIp ?? undefined,
+            clientUserAgent: tracking.userAgent ?? undefined,
+            fbp: tracking.fbp ?? undefined,
+            fbc: tracking.fbc ?? undefined,
+          });
+
+          await admin
+            .from('quiz_orders')
+            .update({
+              provider_response: mergeStoredMetaPurchaseStatus({
+                ...existingProviderResponse,
+                abacatepay: latestAbacatepaySnapshot,
+                abacatepay_webhook: body,
+              }, {
+                purchaseEventId: metaResult.eventId,
+                purchaseSentAt: metaResult.sent ? new Date().toISOString() : null,
+                purchaseLastError: null,
+                purchaseLastResponse: metaResult.response ?? null,
+                purchaseSkippedReason: metaResult.skippedReason ?? null,
+              }),
+            })
+            .eq('id', order.id);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Meta conversion failed.';
+          console.error('[abacatepay-webhook] Meta purchase sync failed:', message);
+
+          await admin
+            .from('quiz_orders')
+            .update({
+              provider_response: mergeStoredMetaPurchaseStatus({
+                ...existingProviderResponse,
+                abacatepay: latestAbacatepaySnapshot,
+                abacatepay_webhook: body,
+              }, {
+                purchaseEventId: eventId,
+                purchaseSentAt: null,
+                purchaseLastError: message,
+              }),
+            })
+            .eq('id', order.id);
+        }
+      }
+
       const n8nPaidUrl = Deno.env.get('N8N_PIX_PAID_WEBHOOK_URL');
       if (n8nPaidUrl) {
         fetch(n8nPaidUrl, {
