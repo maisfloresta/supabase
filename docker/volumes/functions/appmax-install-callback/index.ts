@@ -265,7 +265,11 @@ Deno.serve(async (req) => {
   }
 
   try {
+    console.error(`[appmax-install-callback] URL: ${req.url}`);
+    console.error(`[appmax-install-callback] Body keys: ${JSON.stringify(Object.keys(body))}`);
+    console.error(`[appmax-install-callback] Query params: ${url.searchParams.toString()}`);
     const authorizeToken = getTokenFromInput(url, body);
+    console.error(`[appmax-install-callback] authorizeToken: ${authorizeToken ? authorizeToken.slice(0, 20) + '...' : 'MISSING'}`);
 
     if (!authorizeToken) {
       throw new Error(
@@ -273,11 +277,14 @@ Deno.serve(async (req) => {
       );
     }
 
+    console.error(`[appmax-install-callback] Getting app access token...`);
     const accessToken = await createAppmaxAppAccessToken();
+    console.error(`[appmax-install-callback] Got access token, generating merchant credentials...`);
     const merchantCredentials = await generateAppmaxMerchantCredentials(
       accessToken,
       authorizeToken,
     );
+    console.error(`[appmax-install-callback] Got merchant credentials, storing...`);
     const adminClient = createSupabaseAdminClient();
     const externalId = await createOrGetAppmaxInstallation(
       adminClient,

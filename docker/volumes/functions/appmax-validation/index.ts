@@ -171,15 +171,20 @@ Deno.serve(async (req) => {
 
   try {
     const rawBody = await parseBody(req);
+    console.error(`[appmax-validation] RAW PAYLOAD: ${JSON.stringify(rawBody)}`);
+    console.error(`[appmax-validation] Expected app_id: ${APPMAX_APP_ID}`);
+    console.error(`[appmax-validation] Received app_id: ${rawBody.app_id}`);
     const payload = normalizePayload(rawBody);
     const adminClient = createSupabaseAdminClient();
     const externalId = await createInstallation(adminClient, req, payload);
 
+    console.error(`[appmax-validation] SUCCESS - external_id: ${externalId}`);
     return jsonResponse({ external_id: externalId }, 200);
   } catch (error) {
     const message = error instanceof Error
       ? error.message
       : "Erro inesperado na validação Appmax.";
+    console.error(`[appmax-validation] ERROR: ${message}`);
     const isServerError = message.includes("Variável de ambiente ausente") ||
       message.includes("Não foi possível consultar") ||
       message.includes("Não foi possível registrar");
