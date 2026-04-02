@@ -122,6 +122,28 @@ function getTokenFromInput(
   );
 }
 
+async function findExistingInstallationByExternalKey(
+  adminClient: ReturnType<typeof createSupabaseAdminClient>,
+  externalKey: string,
+) {
+  const { data, error } = await adminClient
+    .schema("appmax")
+    .from("installations")
+    .select("external_id")
+    .eq("external_key", externalKey)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(
+      `Não foi possível consultar a instalação Appmax existente: ${error.message}`,
+    );
+  }
+
+  return data?.external_id ? String(data.external_id) : null;
+}
+
 function buildRedirectUrl(
   redirectTo: string,
   input: {
@@ -334,6 +356,51 @@ Deno.serve(async (req) => {
     const message = error instanceof Error
       ? error.message
       : "Erro inesperado ao concluir a instalacao Appmax.";
+
+    if (
+      message.includes("Não foi possível gerar as credenciais do merchant Appmax")
+    ) {
+      try {
+        const adminClient = createSupabaseAdminClient();
+        const existingExternalId = await findExistingInstallationByExternalKey(
+          adminClient,
+          externalKey,
+        );
+
+        if (existingExternalId) {
+          const redirectUrl = buildRedirectUrl(redirectTo, {
+            status: "success",
+            externalId: existingExternalId,
+            externalKey,
+          });
+
+          if (wantsJson(req, url)) {
+            return jsonResponse({
+              success: true,
+              external_id: existingExternalId,
+              external_key: externalKey,
+              redirect_to: redirectUrl,
+              recovered_from_validation: true,
+            });
+          }
+
+          return htmlResponse(buildHtmlShell({
+            title: "Appmax instalada com sucesso",
+            description:
+              "A instalacao foi confirmada pela validacao da Appmax e as credenciais do merchant ja foram registradas.",
+            actionLabel: "Voltar ao sistema",
+            actionUrl: redirectUrl,
+            tone: "success",
+          }));
+        }
+      } catch (fallbackError) {
+        console.error(
+          "[appmax-install-callback] validation fallback failed:",
+          fallbackError,
+        );
+      }
+    }
+
     const redirectUrl = buildRedirectUrl(redirectTo, {
       status: "error",
       externalKey,

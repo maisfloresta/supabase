@@ -6,6 +6,9 @@ import {
 import { corsHeaders } from "../_shared/cors.ts";
 
 const APPMAX_APP_ID = getAppmaxAppId();
+const APPMAX_VALIDATION_APP_ID = asTrimmedString(
+  Deno.env.get("APPMAX_VALIDATION_APP_ID"),
+);
 
 interface ValidationPayload {
   app_id: string;
@@ -38,6 +41,12 @@ function asTrimmedString(value: unknown) {
   }
 
   return value.trim();
+}
+
+function getAllowedAppIds() {
+  return new Set(
+    [APPMAX_APP_ID, APPMAX_VALIDATION_APP_ID].filter(Boolean),
+  );
 }
 
 async function parseBody(req: Request) {
@@ -97,7 +106,7 @@ function normalizePayload(body: Record<string, unknown>): ValidationPayload {
     app_id: asTrimmedString(body.app_id),
     client_id: asTrimmedString(body.client_id),
     client_secret: asTrimmedString(body.client_secret),
-    external_key: asTrimmedString(body.external_key),
+    external_key: asTrimmedString(body.external_key ?? body.client_key),
   };
 
   if (!payload.app_id) {
@@ -116,7 +125,7 @@ function normalizePayload(body: Record<string, unknown>): ValidationPayload {
     throw new Error("Campo external_key é obrigatório.");
   }
 
-  if (payload.app_id !== APPMAX_APP_ID) {
+  if (!getAllowedAppIds().has(payload.app_id)) {
     throw new Error("app_id inválido para este endpoint.");
   }
 
@@ -172,7 +181,9 @@ Deno.serve(async (req) => {
   try {
     const rawBody = await parseBody(req);
     console.error(`[appmax-validation] RAW PAYLOAD: ${JSON.stringify(rawBody)}`);
-    console.error(`[appmax-validation] Expected app_id: ${APPMAX_APP_ID}`);
+    console.error(
+      `[appmax-validation] Allowed app_ids: ${JSON.stringify(Array.from(getAllowedAppIds()))}`,
+    );
     console.error(`[appmax-validation] Received app_id: ${rawBody.app_id}`);
     const payload = normalizePayload(rawBody);
     const adminClient = createSupabaseAdminClient();
