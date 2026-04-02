@@ -263,11 +263,12 @@ Deno.serve(async (req) => {
 
       if (!existingMeta.purchaseSentAt) {
         const tracking = extractStoredMetaTracking(order.provider_response);
-        const eventId = existingMeta.purchaseEventId ?? `purchase_${order.order_code}`;
+        const eventId = order.order_code;
 
         try {
           const metaResult = await sendMetaPurchaseEvent({
             orderCode: order.order_code,
+            eventId,
             totalCents: Number(order.total_cents ?? 0),
             eventTime: String(updatePayload.paid_at ?? new Date().toISOString()),
             customerName: order.customer_name ?? undefined,

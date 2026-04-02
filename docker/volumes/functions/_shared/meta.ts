@@ -15,6 +15,7 @@ export interface MetaTrackingRecord {
 
 export interface MetaPurchaseEventInput {
   orderCode: string;
+  eventId?: string | null;
   totalCents: number;
   eventTime?: string | number | Date | null;
   customerName?: string | null;
@@ -200,7 +201,7 @@ export function mergeStoredMetaPurchaseStatus(providerResponse: unknown, nextMet
 
 export async function sendMetaPurchaseEvent(input: MetaPurchaseEventInput): Promise<MetaPurchaseSendResult> {
   const config = getMetaConfig();
-  const eventId = `purchase_${input.orderCode}`;
+  const eventId = String(input.eventId ?? input.orderCode).trim() || input.orderCode;
 
   if (!config) {
     return {
@@ -238,9 +239,8 @@ export async function sendMetaPurchaseEvent(input: MetaPurchaseEventInput): Prom
     maybeHashValue(userData, 'st', input.shippingState, normalizeName),
     maybeHashValue(userData, 'zp', input.shippingZip, normalizeZip),
     maybeHashValue(userData, 'external_id', input.customerCpf || input.orderCode, normalizeText),
+    maybeHashValue(userData, 'country', 'br', normalizeText),
   ]);
-
-  userData.country = ['br'];
 
   const payload: Record<string, unknown> = {
     data: [

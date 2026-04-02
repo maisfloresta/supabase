@@ -674,11 +674,12 @@ async function syncMetaPurchaseForOrder(
   }
 
   const tracking = extractStoredMetaTracking(order.provider_response);
-  const eventId = existingMeta.purchaseEventId ?? `purchase_${order.order_code}`;
+  const eventId = order.order_code;
 
   try {
     const result = await sendMetaPurchaseEvent({
       orderCode: order.order_code,
+      eventId,
       totalCents: Number(order.total_cents ?? 0),
       eventTime,
       customerName: order.customer_name ?? undefined,
