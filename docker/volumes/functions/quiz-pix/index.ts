@@ -18,6 +18,7 @@ const CHECKOUT_DESCRIPTION = 'Receba Sementes - Mais Floresta';
 const CHECKOUT_EXPIRATION_SECONDS = 60 * 60; // 1 hour
 const FREIGHT_CENTS = 2500; // R$ 25,00
 const APPMAX_MAX_INSTALLMENTS = 12;
+const APPMAX_INSTALLMENT_FEE_RATE = 0.0219;
 
 const ALLOWED_ORIGINS = (Deno.env.get('ALLOWED_ORIGINS') ?? '').split(',').map(s => s.trim()).filter(Boolean);
 
@@ -218,24 +219,33 @@ function formatPrice(cents: number) {
   return `R$ ${(cents / 100).toFixed(2).replace('.', ',')}`;
 }
 
+function calculateCardChargeTotalCents(totalCents: number, installments: number) {
+  if (installments <= 1) {
+    return totalCents;
+  }
+
+  return Math.round(totalCents * (1 + (APPMAX_INSTALLMENT_FEE_RATE * installments)));
+}
+
 function buildInstallmentLabel(installments: number, installmentCents: number, totalCents: number) {
   if (installments === 1) {
     return `1x de ${formatPrice(totalCents)} à vista`;
   }
 
-  return `${installments}x de ${formatPrice(installmentCents)}`;
+  return `${installments}x de ${formatPrice(installmentCents)} | Total ${formatPrice(totalCents)}`;
 }
 
 function buildCardInstallmentOptions(totalCents: number) {
   return Array.from({ length: APPMAX_MAX_INSTALLMENTS }, (_, index) => {
     const installments = index + 1;
-    const installmentCents = Math.round(totalCents / installments);
+    const chargedTotalCents = calculateCardChargeTotalCents(totalCents, installments);
+    const installmentCents = Math.round(chargedTotalCents / installments);
 
     return {
       installments,
-      totalCents,
+      totalCents: chargedTotalCents,
       installmentCents,
-      label: buildInstallmentLabel(installments, installmentCents, totalCents),
+      label: buildInstallmentLabel(installments, installmentCents, chargedTotalCents),
     };
   });
 }
@@ -257,6 +267,34 @@ function buildCardDisabledConfig(reason: string) {
 function mergeProviderResponse(existing: unknown, next: Record<string, unknown>) {
   const current = isRecord(existing) ? existing : {};
   return { ...current, ...next };
+}
+
+function extractPixSelectionStatus(existing: unknown) {
+  const current = isRecord(existing) && isRecord(existing.pix_selection)
+    ? existing.pix_selection
+    : {};
+
+  return {
+    selectedAt: firstString([current.selected_at, current.selectedAt]),
+    webhookSentAt: firstString([current.webhook_sent_at, current.webhookSentAt]),
+    webhookLastError: firstString([current.webhook_last_error, current.webhookLastError]),
+  };
+}
+
+function mergePixSelectionStatus(existing: unknown, next: {
+  selectedAt?: string | null;
+  webhookSentAt?: string | null;
+  webhookLastError?: string | null;
+}) {
+  const current = extractPixSelectionStatus(existing);
+
+  return mergeProviderResponse(existing, {
+    pix_selection: {
+      selected_at: next.selectedAt ?? current.selectedAt ?? null,
+      webhook_sent_at: next.webhookSentAt ?? current.webhookSentAt ?? null,
+      webhook_last_error: next.webhookLastError ?? current.webhookLastError ?? null,
+    },
+  });
 }
 
 function extractAppmaxStatus(payload: unknown) {
@@ -298,11 +336,13 @@ function extractAppmaxInstallmentOption(payload: unknown, installments: number, 
     (installmentCents !== null ? installmentCents * installments : null);
 
   if (installmentCents === null || totalCents === null) {
+    const fallbackTotalCents = calculateCardChargeTotalCents(originalTotalCents, installments);
+    const fallbackInstallmentCents = Math.round(fallbackTotalCents / installments);
     return {
       installments,
-      totalCents: originalTotalCents,
-      installmentCents: Math.round(originalTotalCents / installments),
-      label: buildInstallmentLabel(installments, Math.round(originalTotalCents / installments), originalTotalCents),
+      totalCents: fallbackTotalCents,
+      installmentCents: fallbackInstallmentCents,
+      label: buildInstallmentLabel(installments, fallbackInstallmentCents, fallbackTotalCents),
     };
   }
 
@@ -555,32 +595,7 @@ function buildAppmaxProducts(items: LineItem[]) {
 }
 
 async function quoteAppmaxInstallments(accessToken: string, totalCents: number) {
-  const quotes = await Promise.all(
-    Array.from({ length: APPMAX_MAX_INSTALLMENTS }, (_, index) => index + 1).map(async (installments) => {
-      try {
-        const payload = await appmaxApiRequest(
-          '/v1/payments/installments',
-          {
-            method: 'POST',
-            body: JSON.stringify({
-              installments,
-              total_value: totalCents,
-              settings: true,
-            }),
-          },
-          accessToken,
-        );
-
-        return extractAppmaxInstallmentOption(payload, installments, totalCents);
-      } catch (error) {
-        console.error(`[quiz-pix] installments quote failed (${installments}x):`, error);
-        return null;
-      }
-    }),
-  );
-
-  const parsedQuotes = quotes.filter((quote): quote is NonNullable<typeof quote> => quote !== null);
-  return parsedQuotes.length > 0 ? parsedQuotes : buildCardInstallmentOptions(totalCents);
+  return buildCardInstallmentOptions(totalCents);
 }
 
 async function buildCardCheckoutConfig(admin: ReturnType<typeof createAdminClient>, totalCents: number) {
@@ -726,6 +741,113 @@ async function syncMetaPurchaseForOrder(
   }
 }
 
+async function notifyPixSelection(orderCode: string) {
+  const admin = createAdminClient();
+  const { data: order, error } = await admin
+    .from('quiz_orders')
+    .select('id, order_code, transparent_id, customer_name, customer_phone, total_cents, pix_br_code, pix_qr_base64, expires_at, items, provider_response')
+    .eq('order_code', orderCode)
+    .maybeSingle();
+
+  if (error || !order) {
+    throw new Error('Pedido não encontrado.');
+  }
+
+  const pixSelection = extractPixSelectionStatus(order.provider_response);
+  if (pixSelection.webhookSentAt) {
+    return {
+      notified: false,
+      alreadyNotified: true,
+      orderCode: order.order_code,
+    };
+  }
+
+  const selectedAt = new Date().toISOString();
+  let mergedProviderResponse = mergePixSelectionStatus(order.provider_response, {
+    selectedAt,
+    webhookSentAt: pixSelection.webhookSentAt ?? null,
+    webhookLastError: null,
+  });
+
+  const n8nWebhookUrl = Deno.env.get('N8N_PIX_WEBHOOK_URL');
+  if (!n8nWebhookUrl) {
+    await admin
+      .from('quiz_orders')
+      .update({
+        payment_method: 'pix',
+        provider_response: mergedProviderResponse,
+      })
+      .eq('id', order.id);
+
+    return {
+      notified: false,
+      alreadyNotified: false,
+      orderCode: order.order_code,
+    };
+  }
+
+  try {
+    const response = await fetch(n8nWebhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event: 'pix_created',
+        orderCode: order.order_code,
+        orderId: order.id,
+        pixId: order.transparent_id,
+        customerName: order.customer_name ?? '',
+        customerPhone: order.customer_phone ?? '',
+        totalCents: Number(order.total_cents ?? 0),
+        brCode: order.pix_br_code ?? '',
+        brCodeBase64: order.pix_qr_base64 ?? null,
+        expiresAt: order.expires_at ?? null,
+        items: order.items,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    mergedProviderResponse = mergePixSelectionStatus(mergedProviderResponse, {
+      selectedAt,
+      webhookSentAt: new Date().toISOString(),
+      webhookLastError: null,
+    });
+
+    await admin
+      .from('quiz_orders')
+      .update({
+        payment_method: 'pix',
+        provider_response: mergedProviderResponse,
+      })
+      .eq('id', order.id);
+
+    return {
+      notified: true,
+      alreadyNotified: false,
+      orderCode: order.order_code,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Erro ao notificar PIX.';
+    mergedProviderResponse = mergePixSelectionStatus(mergedProviderResponse, {
+      selectedAt,
+      webhookSentAt: null,
+      webhookLastError: message,
+    });
+
+    await admin
+      .from('quiz_orders')
+      .update({
+        payment_method: 'pix',
+        provider_response: mergedProviderResponse,
+      })
+      .eq('id', order.id);
+
+    throw new Error('Não foi possível notificar o fluxo de PIX.');
+  }
+}
+
 async function createPixCharge(input: CreateInput, requestContext: RequestContext) {
   const admin = createAdminClient();
   const { lineItems, subtotalCents, totalCents, freightCents, hasGift, freeShipping } = validateAndCalculateCart(input.cart);
@@ -826,28 +948,6 @@ async function createPixCharge(input: CreateInput, requestContext: RequestContex
       .eq('order_code', orderCode);
 
     const card = await cardConfigPromise;
-
-    // 4. Notify N8N about PIX generation (fire-and-forget)
-    const n8nWebhookUrl = Deno.env.get('N8N_PIX_WEBHOOK_URL');
-    if (n8nWebhookUrl) {
-      fetch(n8nWebhookUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          event: 'pix_created',
-          orderCode: order.order_code,
-          orderId: order.id,
-          pixId: chargeData.id,
-          customerName: input.customerName,
-          customerPhone: input.customerPhone,
-          totalCents,
-          brCode: chargeData.brCode ?? '',
-          brCodeBase64: chargeData.brCodeBase64 ?? null,
-          expiresAt: chargeData.expiresAt ?? null,
-          items: lineItems,
-        }),
-      }).catch((err) => console.error('[quiz-pix] N8N webhook error:', err));
-    }
 
     return {
       orderCode: order.order_code,
@@ -1121,6 +1221,11 @@ async function processCardPayment(input: CardPaymentInput) {
   const customerEmail = `${digitsOnly(order.customer_cpf)}@cliente.maisfloresta.cloud`;
   const customerIp = input.customerIp?.trim() || undefined;
   const appmaxProducts = buildAppmaxProducts(lineItems);
+  const baseTotalCents = Number(order.total_cents);
+  const freightCents = Number(order.freight_cents ?? 0);
+  const chargedTotalCents = calculateCardChargeTotalCents(baseTotalCents, input.installments);
+  const installmentFeeCents = chargedTotalCents - baseTotalCents;
+  const chargedProductsValueCents = Math.max(0, baseTotalCents - freightCents + installmentFeeCents);
 
   const customerPayload = await appmaxApiRequest(
     '/v1/customers',
@@ -1163,9 +1268,9 @@ async function processCardPayment(input: CardPaymentInput) {
       method: 'POST',
       body: JSON.stringify({
         customer_id: customerId,
-        products_value: Number(order.total_cents) - Number(order.freight_cents ?? 0),
+        products_value: chargedProductsValueCents,
         discount_value: 0,
-        shipping_value: Number(order.freight_cents ?? 0),
+        shipping_value: freightCents,
         products: appmaxProducts,
       }),
     },
@@ -1212,6 +1317,8 @@ async function processCardPayment(input: CardPaymentInput) {
     abacatepay: isRecord(order.provider_response) ? (order.provider_response as any).abacatepay ?? null : null,
     appmax: {
       installation_external_id: installation.externalId,
+      charged_total_cents: chargedTotalCents,
+      installment_fee_cents: installmentFeeCents,
       customer: customerPayload,
       order: orderPayload,
       payment: paymentPayload,
@@ -1226,7 +1333,7 @@ async function processCardPayment(input: CardPaymentInput) {
       payment_method: 'card',
       payment_status: mappedStatus.paymentStatus,
       order_status: mappedStatus.orderStatus,
-      paid_amount_cents: isPaid ? Number(order.total_cents) : null,
+      paid_amount_cents: isPaid ? chargedTotalCents : null,
       paid_at: isPaid ? new Date().toISOString() : null,
       receipt_url: receiptUrl,
       provider_response: providerResponse,
@@ -1248,7 +1355,7 @@ async function processCardPayment(input: CardPaymentInput) {
       customer_name: order.customer_name,
       customer_phone: order.customer_phone,
       customer_cpf: order.customer_cpf,
-      total_cents: Number(order.total_cents),
+      total_cents: chargedTotalCents,
       shipping_cep: order.shipping_cep,
       shipping_city: order.shipping_city,
       shipping_state: order.shipping_state,
@@ -1265,7 +1372,9 @@ async function processCardPayment(input: CardPaymentInput) {
           orderCode: order.order_code,
           customerName: order.customer_name,
           customerPhone: order.customer_phone,
-          totalCents: Number(order.total_cents),
+          totalCents: chargedTotalCents,
+          baseTotalCents,
+          installmentFeeCents,
           paidAt: new Date().toISOString(),
         }),
       }).catch((err) => console.error('[quiz-pix] N8N paid webhook error:', err));
@@ -1279,8 +1388,8 @@ async function processCardPayment(input: CardPaymentInput) {
       customer_cpf: order.customer_cpf,
       selected_color: order.selected_color,
       items: order.items,
-      total_cents: Number(order.total_cents),
-      freight_cents: Number(order.freight_cents ?? 0),
+      total_cents: chargedTotalCents,
+      freight_cents: freightCents,
       free_shipping: order.free_shipping,
       has_gift: order.has_gift,
       shipping_cep: order.shipping_cep,
@@ -1411,6 +1520,16 @@ Deno.serve(async (req) => {
       return jsonResponse({ success: true, data });
     }
 
+    if (action === 'pix_selected') {
+      const orderCode = String(body.orderCode ?? '').trim();
+      if (!orderCode) {
+        return errorResponse('Pedido inválido.', 400);
+      }
+
+      const data = await notifyPixSelection(orderCode);
+      return jsonResponse({ success: true, data });
+    }
+
     if (action === 'card') {
       const orderCode = String(body.orderCode ?? '').trim();
       if (orderCode && isRateLimited(`card:${orderCode}`)) {
@@ -1444,12 +1563,14 @@ Deno.serve(async (req) => {
       'CPF do titular inválido.',
       'Parcelamento inválido.',
       'Pedido não encontrado.',
+      'ID do PIX inválido.',
       'Pedido sem itens.',
       'Pagamento já confirmado.',
       'Resposta inválida ao gerar o pagamento.',
       'Resposta inválida ao consultar o pagamento.',
       'O pagamento não foi aprovado.',
       'O cartão está temporariamente indisponível. Tente novamente em instantes.',
+      'Não foi possível notificar o fluxo de PIX.',
     ];
     const isSafe = safeMessages.some(m => message.includes(m));
     const clientMessage = isSafe ? message : 'Erro ao processar a solicitação. Tente novamente.';
