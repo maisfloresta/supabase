@@ -6,8 +6,20 @@ export interface MetaTrackingRecord {
   fbp?: string | null;
   fbc?: string | null;
   fbclid?: string | null;
+  gclid?: string | null;
+  ttclid?: string | null;
   pageUrl?: string | null;
+  landingPageUrl?: string | null;
   referrer?: string | null;
+  utmSource?: string | null;
+  utmMedium?: string | null;
+  utmCampaign?: string | null;
+  utmContent?: string | null;
+  utmTerm?: string | null;
+  utmId?: string | null;
+  campaignId?: string | null;
+  adsetId?: string | null;
+  adId?: string | null;
   userAgent?: string | null;
   clientIp?: string | null;
   customerEmail?: string | null;
@@ -153,8 +165,20 @@ export function extractStoredMetaTracking(providerResponse: unknown): MetaTracki
     fbp: firstString([tracking.fbp]),
     fbc: firstString([tracking.fbc]),
     fbclid: firstString([tracking.fbclid]),
+    gclid: firstString([tracking.gclid]),
+    ttclid: firstString([tracking.ttclid]),
     pageUrl: firstString([tracking.pageUrl]),
+    landingPageUrl: firstString([tracking.landingPageUrl]),
     referrer: firstString([tracking.referrer]),
+    utmSource: firstString([tracking.utmSource]),
+    utmMedium: firstString([tracking.utmMedium]),
+    utmCampaign: firstString([tracking.utmCampaign]),
+    utmContent: firstString([tracking.utmContent]),
+    utmTerm: firstString([tracking.utmTerm]),
+    utmId: firstString([tracking.utmId]),
+    campaignId: firstString([tracking.campaignId]),
+    adsetId: firstString([tracking.adsetId]),
+    adId: firstString([tracking.adId]),
     userAgent: firstString([tracking.userAgent]),
     clientIp: firstString([tracking.clientIp]),
     customerEmail: firstString([tracking.customerEmail]),
