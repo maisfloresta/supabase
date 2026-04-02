@@ -8,6 +8,7 @@ import {
   sendMetaPurchaseEvent,
   type MetaTrackingRecord,
 } from '../_shared/meta.ts';
+import { syncQuizLogisticsForOrder } from '../_shared/quizLogistics.ts';
 
 const ABACATEPAY_API_URL = 'https://api.abacatepay.com';
 const APPMAX_API_URL = Deno.env.get('APPMAX_API_URL') ?? 'https://api.appmax.com.br';
@@ -889,7 +890,7 @@ async function checkPixStatus(pixId: string) {
 
   const { data: currentOrder } = await admin
     .from('quiz_orders')
-    .select('id, payment_method, payment_status, order_code, customer_name, customer_phone, customer_cpf, total_cents, shipping_cep, shipping_city, shipping_state, provider_response')
+    .select('id, payment_method, payment_status, order_code, customer_name, customer_phone, customer_cpf, selected_color, items, total_cents, freight_cents, free_shipping, has_gift, shipping_cep, shipping_street, shipping_number, shipping_complement, shipping_neighborhood, shipping_city, shipping_state, provider_response, logistics_webhook_sent_at')
     .eq('transparent_id', chargeData.id ?? pixId)
     .maybeSingle();
 
@@ -927,36 +928,62 @@ async function checkPixStatus(pixId: string) {
       .eq('transparent_id', chargeData.id);
   }
 
-  // Notify N8N when payment transitions to paid (fire-and-forget)
-  if (mapped.paymentStatus === 'paid' && currentOrder && currentOrder.payment_status !== 'paid') {
-    await syncMetaPurchaseForOrder(admin, {
+  if (mapped.paymentStatus === 'paid' && currentOrder) {
+    if (currentOrder.payment_status !== 'paid') {
+      await syncMetaPurchaseForOrder(admin, {
+        id: currentOrder.id,
+        order_code: currentOrder.order_code,
+        customer_name: currentOrder.customer_name,
+        customer_phone: currentOrder.customer_phone,
+        customer_cpf: currentOrder.customer_cpf,
+        total_cents: currentOrder.total_cents,
+        shipping_cep: currentOrder.shipping_cep,
+        shipping_city: currentOrder.shipping_city,
+        shipping_state: currentOrder.shipping_state,
+        provider_response: mergedProviderResponse,
+      }, chargeData.updatedAt ?? chargeData.createdAt ?? new Date().toISOString());
+
+      const n8nPaidUrl = Deno.env.get('N8N_PIX_PAID_WEBHOOK_URL');
+      if (n8nPaidUrl) {
+        fetch(n8nPaidUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            event: 'pix_paid',
+            orderCode: currentOrder.order_code,
+            customerName: currentOrder.customer_name ?? '',
+            customerPhone: currentOrder.customer_phone ?? '',
+            totalCents: currentOrder.total_cents ?? chargeData.amount ?? 0,
+            paidAt: chargeData.updatedAt ?? chargeData.createdAt ?? new Date().toISOString(),
+          }),
+        }).catch((err) => console.error('[quiz-pix] N8N paid webhook error:', err));
+      }
+    }
+
+    await syncQuizLogisticsForOrder(admin, {
       id: currentOrder.id,
       order_code: currentOrder.order_code,
       customer_name: currentOrder.customer_name,
       customer_phone: currentOrder.customer_phone,
       customer_cpf: currentOrder.customer_cpf,
+      selected_color: currentOrder.selected_color,
+      items: currentOrder.items,
       total_cents: currentOrder.total_cents,
+      freight_cents: currentOrder.freight_cents,
+      free_shipping: currentOrder.free_shipping,
+      has_gift: currentOrder.has_gift,
       shipping_cep: currentOrder.shipping_cep,
+      shipping_street: currentOrder.shipping_street,
+      shipping_number: currentOrder.shipping_number,
+      shipping_complement: currentOrder.shipping_complement,
+      shipping_neighborhood: currentOrder.shipping_neighborhood,
       shipping_city: currentOrder.shipping_city,
       shipping_state: currentOrder.shipping_state,
       provider_response: mergedProviderResponse,
-    }, chargeData.updatedAt ?? chargeData.createdAt ?? new Date().toISOString());
-
-    const n8nPaidUrl = Deno.env.get('N8N_PIX_PAID_WEBHOOK_URL');
-    if (n8nPaidUrl) {
-      fetch(n8nPaidUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          event: 'pix_paid',
-          orderCode: currentOrder?.order_code ?? '',
-          customerName: currentOrder?.customer_name ?? '',
-          customerPhone: currentOrder?.customer_phone ?? '',
-          totalCents: currentOrder?.total_cents ?? chargeData.amount ?? 0,
-          paidAt: chargeData.updatedAt ?? chargeData.createdAt ?? new Date().toISOString(),
-        }),
-      }).catch((err) => console.error('[quiz-pix] N8N paid webhook error:', err));
-    }
+      logistics_webhook_sent_at: currentOrder.logistics_webhook_sent_at,
+    }, {
+      source: 'quiz-pix:status',
+    });
   }
 
   return {
@@ -999,8 +1026,11 @@ async function processCardPayment(input: CardPaymentInput) {
       customer_name,
       customer_phone,
       customer_cpf,
+      selected_color,
       total_cents,
       freight_cents,
+      free_shipping,
+      has_gift,
       shipping_cep,
       shipping_street,
       shipping_number,
@@ -1010,7 +1040,8 @@ async function processCardPayment(input: CardPaymentInput) {
       shipping_state,
       items,
       payment_status,
-      provider_response
+      provider_response,
+      logistics_webhook_sent_at
     `)
     .eq('order_code', input.orderCode.trim())
     .single();
@@ -1020,6 +1051,31 @@ async function processCardPayment(input: CardPaymentInput) {
   }
 
   if (order.payment_status === 'paid') {
+    await syncQuizLogisticsForOrder(admin, {
+      id: order.id,
+      order_code: order.order_code,
+      customer_name: order.customer_name,
+      customer_phone: order.customer_phone,
+      customer_cpf: order.customer_cpf,
+      selected_color: order.selected_color,
+      items: order.items,
+      total_cents: Number(order.total_cents),
+      freight_cents: Number(order.freight_cents ?? 0),
+      free_shipping: order.free_shipping,
+      has_gift: order.has_gift,
+      shipping_cep: order.shipping_cep,
+      shipping_street: order.shipping_street,
+      shipping_number: order.shipping_number,
+      shipping_complement: order.shipping_complement,
+      shipping_neighborhood: order.shipping_neighborhood,
+      shipping_city: order.shipping_city,
+      shipping_state: order.shipping_state,
+      provider_response: order.provider_response,
+      logistics_webhook_sent_at: order.logistics_webhook_sent_at,
+    }, {
+      source: 'quiz-pix:card-existing',
+    });
+
     return {
       orderCode: order.order_code,
       status: 'APROVADO',
@@ -1214,6 +1270,31 @@ async function processCardPayment(input: CardPaymentInput) {
         }),
       }).catch((err) => console.error('[quiz-pix] N8N paid webhook error:', err));
     }
+
+    await syncQuizLogisticsForOrder(admin, {
+      id: order.id,
+      order_code: order.order_code,
+      customer_name: order.customer_name,
+      customer_phone: order.customer_phone,
+      customer_cpf: order.customer_cpf,
+      selected_color: order.selected_color,
+      items: order.items,
+      total_cents: Number(order.total_cents),
+      freight_cents: Number(order.freight_cents ?? 0),
+      free_shipping: order.free_shipping,
+      has_gift: order.has_gift,
+      shipping_cep: order.shipping_cep,
+      shipping_street: order.shipping_street,
+      shipping_number: order.shipping_number,
+      shipping_complement: order.shipping_complement,
+      shipping_neighborhood: order.shipping_neighborhood,
+      shipping_city: order.shipping_city,
+      shipping_state: order.shipping_state,
+      provider_response: providerResponse,
+      logistics_webhook_sent_at: order.logistics_webhook_sent_at,
+    }, {
+      source: 'quiz-pix:card-paid',
+    });
   }
 
   return {
