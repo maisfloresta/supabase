@@ -1,5 +1,5 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
-import { hmac } from 'https://deno.land/x/hmac@v2.0.1/mod.ts';
+import { verifyAbacatePayWebhookSignature } from '../_shared/abacatepay.ts';
 import {
   extractStoredMetaPurchaseStatus,
   extractStoredMetaTracking,
@@ -10,7 +10,7 @@ import { syncQuizLogisticsForOrder } from '../_shared/quizLogistics.ts';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-abacatepay-signature',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-webhook-signature, x-abacatepay-signature',
 };
 
 function jsonResponse(payload: Record<string, unknown>, status = 200) {
@@ -56,6 +56,28 @@ function firstNumber(candidates: unknown[]) {
   }
 
   return null;
+}
+
+function getSignatureFromHeaders(req: Request) {
+  return firstString([
+    req.headers.get('x-webhook-signature'),
+    req.headers.get('x-abacatepay-signature'),
+  ]);
+}
+
+function isWebhookSecretValid(req: Request) {
+  const configuredSecret = Deno.env.get('ABACATEPAY_WEBHOOK_SECRET')?.trim();
+  if (!configuredSecret) {
+    return true;
+  }
+
+  const receivedSecret = new URL(req.url).searchParams.get('webhookSecret')?.trim();
+  if (!receivedSecret) {
+    console.warn('[abacatepay-webhook] webhookSecret not present in URL. Relying on signed header only.');
+    return true;
+  }
+
+  return receivedSecret === configuredSecret;
 }
 
 function extractWebhookData(payload: Record<string, unknown>) {
@@ -138,15 +160,19 @@ Deno.serve(async (req) => {
   try {
     const rawBody = await req.text();
 
-    // Validate signature if secret is set
-    const secret = Deno.env.get('ABACATEPAY_WEBHOOK_SECRET');
-    if (secret) {
-      const signature = req.headers.get('x-abacatepay-signature') ?? '';
-      const expected = hmac('sha256', secret, rawBody, 'utf8', 'hex');
-      if (signature !== expected) {
-        console.error('[abacatepay-webhook] Invalid signature');
-        return jsonResponse({ success: false, error: 'Invalid signature' }, 401);
-      }
+    const signature = getSignatureFromHeaders(req);
+    const isValidSignature = await verifyAbacatePayWebhookSignature(rawBody, signature);
+    if (!isValidSignature) {
+      console.error('[abacatepay-webhook] Invalid signature', {
+        hasXWebhookSignature: req.headers.has('x-webhook-signature'),
+        hasLegacySignature: req.headers.has('x-abacatepay-signature'),
+      });
+      return jsonResponse({ success: false, error: 'Invalid signature' }, 401);
+    }
+
+    if (!isWebhookSecretValid(req)) {
+      console.error('[abacatepay-webhook] Invalid webhookSecret');
+      return jsonResponse({ success: false, error: 'Invalid webhook secret' }, 401);
     }
 
     const body = JSON.parse(rawBody);

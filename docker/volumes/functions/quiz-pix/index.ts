@@ -13,6 +13,8 @@ import { syncQuizLogisticsForOrder } from '../_shared/quizLogistics.ts';
 const ABACATEPAY_API_URL = 'https://api.abacatepay.com';
 const APPMAX_API_URL = Deno.env.get('APPMAX_API_URL') ?? 'https://api.appmax.com.br';
 const APPMAX_AUTH_URL = Deno.env.get('APPMAX_AUTH_URL') ?? 'https://auth.appmax.com.br/oauth2/token';
+const APPMAX_EXTERNAL_KEY = (Deno.env.get('APPMAX_DEFAULT_EXTERNAL_KEY') ?? 'quiz.maisfloresta.cloud').trim();
+const APPMAX_VALIDATION_APP_ID = Deno.env.get('APPMAX_VALIDATION_APP_ID')?.trim() || null;
 const APPMAX_SOFT_DESCRIPTOR = (Deno.env.get('APPMAX_SOFT_DESCRIPTOR') ?? 'MAISFLORESTA').slice(0, 13);
 const CHECKOUT_DESCRIPTION = 'Receba Sementes - Mais Floresta';
 const CHECKOUT_EXPIRATION_SECONDS = 60 * 60; // 1 hour
@@ -415,12 +417,16 @@ interface LineItem {
 
 interface AppmaxInstallationRow {
   external_id: string;
+  app_id: string;
+  external_key: string;
   merchant_client_id_encrypted: string;
   merchant_client_secret_encrypted: string;
 }
 
 interface AppmaxMerchantCredentials {
-  externalId: string;
+  installationExternalId: string;
+  installationAppId: string;
+  externalKey: string;
   clientId: string;
   clientSecret: string;
 }
@@ -479,7 +485,12 @@ async function abacatePayRequest(path: string, init: RequestInit, useV1Key = fal
 
   const payload = (await response.json().catch(() => null)) as Record<string, unknown> | null;
 
-  console.error(`[AbacatePay] ${path} -> status=${response.status} response=${JSON.stringify(payload)}`);
+  const logMessage = `[AbacatePay] ${path} -> status=${response.status} response=${JSON.stringify(payload)}`;
+  if (response.ok) {
+    console.log(logMessage);
+  } else {
+    console.error(logMessage);
+  }
 
   if (!response.ok) {
     const msg = (payload as any)?.error || (payload as any)?.message || 'Falha ao comunicar com a AbacatePay.';
@@ -508,8 +519,15 @@ async function appmaxAuthRequest(credentials: AppmaxMerchantCredentials) {
   });
 
   const payload = await response.json().catch(() => null);
+  const loggedPayload = isRecord(payload)
+    ? {
+      ...payload,
+      access_token: payload.access_token ? '<present>' : payload.access_token,
+      refresh_token: payload.refresh_token ? '<present>' : payload.refresh_token,
+    }
+    : payload;
 
-  console.error(`[Appmax] auth -> status=${response.status} response=${JSON.stringify(payload)}`);
+  console.error(`[Appmax] auth -> status=${response.status} response=${JSON.stringify(loggedPayload)}`);
 
   if (!response.ok) {
     const msg = firstString([
@@ -561,13 +579,19 @@ async function appmaxApiRequest(path: string, init: RequestInit, accessToken: st
 }
 
 async function getLatestAppmaxInstallation(admin: ReturnType<typeof createAdminClient>) {
-  const { data, error } = await admin
+  let query = admin
     .schema('appmax')
     .from('installations')
-    .select('external_id, merchant_client_id_encrypted, merchant_client_secret_encrypted')
+    .select('external_id, app_id, external_key, merchant_client_id_encrypted, merchant_client_secret_encrypted')
+    .eq('external_key', APPMAX_EXTERNAL_KEY)
     .order('created_at', { ascending: false })
-    .limit(1)
-    .maybeSingle<AppmaxInstallationRow>();
+    .limit(1);
+
+  if (APPMAX_VALIDATION_APP_ID) {
+    query = query.eq('app_id', APPMAX_VALIDATION_APP_ID);
+  }
+
+  const { data, error } = await query.maybeSingle<AppmaxInstallationRow>();
 
   if (error) {
     throw new Error(`Não foi possível consultar a instalação Appmax: ${error.message}`);
@@ -578,7 +602,9 @@ async function getLatestAppmaxInstallation(admin: ReturnType<typeof createAdminC
   }
 
   return {
-    externalId: data.external_id,
+    installationExternalId: data.external_id,
+    installationAppId: data.app_id,
+    externalKey: data.external_key,
     clientId: await decryptSecret(data.merchant_client_id_encrypted),
     clientSecret: await decryptSecret(data.merchant_client_secret_encrypted),
   } satisfies AppmaxMerchantCredentials;
@@ -612,7 +638,7 @@ async function buildCardCheckoutConfig(admin: ReturnType<typeof createAdminClien
     return {
       enabled: true,
       reason: null,
-      externalId: installation.externalId,
+      externalId: installation.installationExternalId,
       installments,
     };
   } catch (error) {
@@ -979,9 +1005,18 @@ async function checkPixStatus(pixId: string) {
   const admin = createAdminClient();
 
   const query = new URLSearchParams({ id: pixId });
-  const statusPayload = await abacatePayRequest(`/v1/pixQrCode/check?${query.toString()}`, {
-    method: 'GET',
-  });
+  let statusPayload: Record<string, unknown>;
+
+  try {
+    statusPayload = await abacatePayRequest(`/v2/transparents/get?${query.toString()}`, {
+      method: 'GET',
+    });
+  } catch (error) {
+    console.warn(`[quiz-pix] Falling back to legacy PIX status endpoint for ${pixId}:`, error);
+    statusPayload = await abacatePayRequest(`/v1/pixQrCode/check?${query.toString()}`, {
+      method: 'GET',
+    });
+  }
 
   const chargeData = (statusPayload as any)?.data;
   if (!chargeData) {
@@ -1316,7 +1351,9 @@ async function processCardPayment(input: CardPaymentInput) {
   const providerResponse = mergeProviderResponse(order.provider_response, {
     abacatepay: isRecord(order.provider_response) ? (order.provider_response as any).abacatepay ?? null : null,
     appmax: {
-      installation_external_id: installation.externalId,
+      installation_external_id: installation.installationExternalId,
+      installation_app_id: installation.installationAppId,
+      installation_external_key: installation.externalKey,
       charged_total_cents: chargedTotalCents,
       installment_fee_cents: installmentFeeCents,
       customer: customerPayload,
