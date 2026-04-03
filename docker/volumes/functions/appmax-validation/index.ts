@@ -180,16 +180,10 @@ Deno.serve(async (req) => {
 
   try {
     const rawBody = await parseBody(req);
-    console.error(`[appmax-validation] RAW PAYLOAD: ${JSON.stringify(rawBody)}`);
-    console.error(
-      `[appmax-validation] Allowed app_ids: ${JSON.stringify(Array.from(getAllowedAppIds()))}`,
-    );
-    console.error(`[appmax-validation] Received app_id: ${rawBody.app_id}`);
     const payload = normalizePayload(rawBody);
     const adminClient = createSupabaseAdminClient();
     const externalId = await createInstallation(adminClient, req, payload);
 
-    console.error(`[appmax-validation] SUCCESS - external_id: ${externalId}`);
     return jsonResponse({ external_id: externalId }, 200);
   } catch (error) {
     const message = error instanceof Error

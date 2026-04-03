@@ -196,8 +196,6 @@ serve(async (req) => {
         const payload = await req.json() as JsonObject
         const headers = Object.fromEntries(req.headers.entries())
 
-        console.log('CartPanda Webhook - Received:', payload)
-
         // Extrai campos indexados de forma segura (sem gravar objetos gigantes em colunas text indexadas)
         const externalEntityId = pickExternalEntityId(payload)
         const eventType = pickEventType(payload)
@@ -205,6 +203,8 @@ serve(async (req) => {
         const sourceStoreId = pickSourceStoreId(payload)
         const storeId = await resolveStoreId('cartpanda', sourceStoreId)
         const dedupeKey = `cartpanda_${eventType}_${externalEntityId}`
+
+        console.log(`CartPanda Webhook - Received event=${eventType} entity=${externalEntityType} id=${externalEntityId}`)
 
         // 1. Criar registro em integrations.integration_events
         const { data: event, error: eventError } = await supabase

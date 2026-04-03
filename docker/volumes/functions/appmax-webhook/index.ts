@@ -42,6 +42,37 @@ function sanitizeHeaders(headers: Headers) {
   );
 }
 
+function parseBearerToken(headerValue: string | null) {
+  if (!headerValue) return null;
+  const [scheme, token] = headerValue.trim().split(/\s+/, 2);
+  if (!scheme || !token || scheme.toLowerCase() !== "bearer") {
+    return null;
+  }
+  return token;
+}
+
+function getWebhookToken(req: Request) {
+  const url = new URL(req.url);
+  return firstString([
+    req.headers.get("x-webhook-shared-token"),
+    req.headers.get("x-appmax-webhook-token"),
+    url.searchParams.get("webhookSecret"),
+    url.searchParams.get("token"),
+    parseBearerToken(req.headers.get("authorization")),
+  ]);
+}
+
+function isWebhookAuthorized(req: Request) {
+  const expectedToken = Deno.env.get("APPMAX_WEBHOOK_SECRET")?.trim();
+
+  if (!expectedToken) {
+    return true;
+  }
+
+  const receivedToken = getWebhookToken(req);
+  return receivedToken === expectedToken;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -357,6 +388,10 @@ Deno.serve(async (req) => {
 
   if (req.method !== "POST") {
     return errorResponse("Método não suportado.", 405);
+  }
+
+  if (!isWebhookAuthorized(req)) {
+    return errorResponse("Webhook não autorizado.", 401);
   }
 
   try {

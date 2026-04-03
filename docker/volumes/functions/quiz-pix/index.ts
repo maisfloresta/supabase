@@ -34,20 +34,29 @@ function getCorsHeaders(req: Request) {
   };
 }
 
+function isOriginAllowed(req: Request) {
+  if (ALLOWED_ORIGINS.length === 0) {
+    return true;
+  }
+
+  const origin = req.headers.get('origin') ?? '';
+  return ALLOWED_ORIGINS.includes(origin);
+}
+
 // ── Rate limiter (per order code / per IP, per instance) ──
 const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
 const RATE_LIMIT_MAX = 5;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 
-function isRateLimited(key: string): boolean {
+function isRateLimited(key: string, maxRequests = RATE_LIMIT_MAX, windowMs = RATE_LIMIT_WINDOW_MS): boolean {
   const now = Date.now();
   const entry = rateLimitMap.get(key);
   if (!entry || now > entry.resetAt) {
-    rateLimitMap.set(key, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+    rateLimitMap.set(key, { count: 1, resetAt: now + windowMs });
     return false;
   }
   entry.count++;
-  return entry.count > RATE_LIMIT_MAX;
+  return entry.count > maxRequests;
 }
 
 setInterval(() => {
@@ -198,6 +207,29 @@ function findValueByKeys(input: unknown, keys: string[]): unknown {
   }
 
   return undefined;
+}
+
+function summarizeAppmaxLogPayload(payload: unknown) {
+  if (!isRecord(payload)) {
+    return payload;
+  }
+
+  return {
+    error: firstString([
+      payload.error,
+      payload.error_description,
+      payload.message,
+      isRecord(payload.errors) ? payload.errors.message : null,
+    ]),
+    status: firstString([
+      payload.status,
+      isRecord(payload.data) ? payload.data.status : null,
+    ]),
+    code: firstString([
+      payload.code,
+      isRecord(payload.error) ? (payload.error as Record<string, unknown>).code : null,
+    ]),
+  };
 }
 
 function toIntegerMoney(value: unknown) {
@@ -564,7 +596,7 @@ async function appmaxApiRequest(path: string, init: RequestInit, accessToken: st
 
   const payload = await response.json().catch(() => null);
 
-  console.error(`[Appmax] ${path} -> status=${response.status} response=${JSON.stringify(payload)}`);
+  console.error(`[Appmax] ${path} -> status=${response.status} summary=${JSON.stringify(summarizeAppmaxLogPayload(payload))}`);
 
   if (!response.ok) {
     const msg = firstString([
@@ -1468,14 +1500,23 @@ Deno.serve(async (req) => {
     return errorResponse('Método não suportado.', 405);
   }
 
+  if (!isOriginAllowed(req)) {
+    return errorResponse('Origem não autorizada.', 403);
+  }
+
   try {
     const body = (await req.json()) as Record<string, unknown>;
     const action = body.action;
+    const requestContext = extractRequestContext(req);
+    const clientIpKey = requestContext.clientIp ?? 'unknown';
 
     if (action === 'create') {
       // Rate limit by CPF to prevent abuse
       const cpfKey = digitsOnly(String(body.customerCpf ?? ''));
       if (cpfKey && isRateLimited(`create:${cpfKey}`)) {
+        return errorResponse('Muitas tentativas. Aguarde um momento.', 429);
+      }
+      if (isRateLimited(`create-ip:${clientIpKey}`, 12)) {
         return errorResponse('Muitas tentativas. Aguarde um momento.', 429);
       }
 
@@ -1538,7 +1579,7 @@ Deno.serve(async (req) => {
           city: String(shipping.city ?? '').trim().slice(0, 100),
           state: String(shipping.state ?? '').trim().slice(0, 2),
         },
-      }, extractRequestContext(req));
+      }, requestContext);
       return jsonResponse({ success: true, data });
     }
 
@@ -1552,6 +1593,9 @@ Deno.serve(async (req) => {
       if (isRateLimited(`status:${pixKey}`)) {
         return errorResponse('Muitas consultas. Aguarde um momento.', 429);
       }
+      if (isRateLimited(`status-ip:${clientIpKey}`, 60)) {
+        return errorResponse('Muitas consultas. Aguarde um momento.', 429);
+      }
 
       const data = await checkPixStatus(pixKey);
       return jsonResponse({ success: true, data });
@@ -1562,6 +1606,9 @@ Deno.serve(async (req) => {
       if (!orderCode) {
         return errorResponse('Pedido inválido.', 400);
       }
+      if (isRateLimited(`pix-selected-ip:${clientIpKey}`, 30)) {
+        return errorResponse('Muitas tentativas. Aguarde um momento.', 429);
+      }
 
       const data = await notifyPixSelection(orderCode);
       return jsonResponse({ success: true, data });
@@ -1570,6 +1617,9 @@ Deno.serve(async (req) => {
     if (action === 'card') {
       const orderCode = String(body.orderCode ?? '').trim();
       if (orderCode && isRateLimited(`card:${orderCode}`)) {
+        return errorResponse('Muitas tentativas de pagamento. Aguarde um momento.', 429);
+      }
+      if (isRateLimited(`card-ip:${clientIpKey}`, 12)) {
         return errorResponse('Muitas tentativas de pagamento. Aguarde um momento.', 429);
       }
 
@@ -1608,6 +1658,7 @@ Deno.serve(async (req) => {
       'O pagamento não foi aprovado.',
       'O cartão está temporariamente indisponível. Tente novamente em instantes.',
       'Não foi possível notificar o fluxo de PIX.',
+      'Origem não autorizada.',
     ];
     const isSafe = safeMessages.some(m => message.includes(m));
     const clientMessage = isSafe ? message : 'Erro ao processar a solicitação. Tente novamente.';

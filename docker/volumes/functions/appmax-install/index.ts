@@ -40,6 +40,34 @@ function asTrimmedString(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function parseBearerToken(headerValue: string | null) {
+  if (!headerValue) return null;
+  const [scheme, token] = headerValue.trim().split(/\s+/, 2);
+  if (!scheme || !token || scheme.toLowerCase() !== "bearer") {
+    return null;
+  }
+  return token;
+}
+
+function isAuthorizedRequest(req: Request) {
+  const expectedToken = Deno.env.get("APPMAX_INSTALL_SECRET")?.trim();
+
+  if (!expectedToken) {
+    return true;
+  }
+
+  const url = new URL(req.url);
+  const receivedToken = asTrimmedString(
+    req.headers.get("x-webhook-shared-token") ??
+      req.headers.get("x-appmax-install-token") ??
+      url.searchParams.get("token") ??
+      url.searchParams.get("installToken") ??
+      parseBearerToken(req.headers.get("authorization")),
+  );
+
+  return receivedToken === expectedToken;
+}
+
 async function parseBody(req: Request) {
   const contentType = req.headers.get("content-type") ?? "";
 
@@ -194,6 +222,10 @@ Deno.serve(async (req) => {
     return errorResponse("Método não suportado.", 405);
   }
 
+  if (!isAuthorizedRequest(req)) {
+    return errorResponse("Requisição não autorizada.", 401);
+  }
+
   try {
     const url = new URL(req.url);
     const body = req.method === "POST" ? await parseBody(req) : {};
@@ -219,7 +251,6 @@ Deno.serve(async (req) => {
         app_id: getAppmaxAppId(),
         external_key: externalKey,
         callback_url: callbackUrl,
-        authorize_token: authorizeToken,
         authorize_url: authorizeUrl,
         redirect_to: redirectTo,
       });

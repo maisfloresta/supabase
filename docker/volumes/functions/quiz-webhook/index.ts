@@ -12,6 +12,15 @@ function getCorsHeaders(req: Request) {
   };
 }
 
+function isOriginAllowed(req: Request) {
+  if (ALLOWED_ORIGINS.length === 0) {
+    return true;
+  }
+
+  const origin = req.headers.get('origin') ?? '';
+  return ALLOWED_ORIGINS.includes(origin);
+}
+
 function jsonResponse(payload: Record<string, unknown>, status: number, cors: Record<string, string>) {
   return new Response(JSON.stringify(payload), {
     status,
@@ -75,6 +84,10 @@ Deno.serve(async (req) => {
 
   if (req.method !== 'POST') {
     return jsonResponse({ success: false, error: 'Method not allowed' }, 405, cors);
+  }
+
+  if (!isOriginAllowed(req)) {
+    return jsonResponse({ success: false, error: 'Origin not allowed' }, 403, cors);
   }
 
   try {

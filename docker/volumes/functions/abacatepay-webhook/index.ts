@@ -176,13 +176,16 @@ Deno.serve(async (req) => {
     }
 
     const body = JSON.parse(rawBody);
-    console.log('[abacatepay-webhook] Received:', JSON.stringify(body));
 
     const parsed = extractWebhookData(isRecord(body) ? body : {});
     const event = parsed.event;
     const transparentId = parsed.transparentId;
     const metadataQuizOrderId = firstNumber([parsed.metadata.quizOrderId]);
     const metadataQuizOrderCode = firstString([parsed.metadata.quizOrderCode]);
+
+    console.log(
+      `[abacatepay-webhook] Received event=${event || 'unknown'} transparent_id=${transparentId ?? 'missing'} order_code=${metadataQuizOrderCode ?? 'missing'} order_id=${metadataQuizOrderId ?? 'missing'}`,
+    );
 
     if (!transparentId && !metadataQuizOrderId && !metadataQuizOrderCode) {
       console.error('[abacatepay-webhook] No order identifier found in payload');

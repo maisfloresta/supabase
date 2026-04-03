@@ -9,6 +9,9 @@ const ALLOWED_ORIGINS = (Deno.env.get('ALLOWED_ORIGINS') ?? '').split(',').map(s
 const HASHED_USER_DATA_KEYS = ['em', 'ph', 'fn', 'ln', 'ct', 'st', 'zp', 'country', 'external_id'] as const;
 const STRONG_MATCH_KEYS = ['fbp', 'fbc', 'em', 'ph', 'external_id'] as const;
 const MAX_EVENTS_PER_REQUEST = 10;
+const RATE_LIMIT_MAX = 20;
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
 
 function getCorsHeaders(req: Request) {
   const origin = req.headers.get('origin') ?? '';
@@ -19,6 +22,44 @@ function getCorsHeaders(req: Request) {
     'Vary': 'Origin',
   };
 }
+
+function isOriginAllowed(req: Request) {
+  if (ALLOWED_ORIGINS.length === 0) {
+    return true;
+  }
+
+  const origin = req.headers.get('origin') ?? '';
+  return ALLOWED_ORIGINS.includes(origin);
+}
+
+function getClientIp(req: Request) {
+  return req.headers.get('cf-connecting-ip')
+    ?? req.headers.get('x-real-ip')
+    ?? req.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
+    ?? 'unknown';
+}
+
+function isRateLimited(key: string) {
+  const now = Date.now();
+  const entry = rateLimitMap.get(key);
+
+  if (!entry || now > entry.resetAt) {
+    rateLimitMap.set(key, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+    return false;
+  }
+
+  entry.count++;
+  return entry.count > RATE_LIMIT_MAX;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of rateLimitMap) {
+    if (now > entry.resetAt) {
+      rateLimitMap.delete(key);
+    }
+  }
+}, 60_000);
 
 const ALLOWED_EVENT_NAMES = new Set([
   'PageView', 'Lead', 'InitiateCheckout', 'AddPaymentInfo', 'Purchase',
@@ -101,6 +142,7 @@ function jsonResponse(payload: Record<string, unknown>, status: number, cors: Re
 
 Deno.serve(async (req) => {
   const cors = getCorsHeaders(req);
+  const clientIp = getClientIp(req);
 
   if (req.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: cors });
@@ -108,6 +150,14 @@ Deno.serve(async (req) => {
 
   if (req.method !== 'POST') {
     return jsonResponse({ success: false, error: 'Method not allowed' }, 405, cors);
+  }
+
+  if (!isOriginAllowed(req)) {
+    return jsonResponse({ success: false, error: 'Origin not allowed' }, 403, cors);
+  }
+
+  if (isRateLimited(`fb-capi:${clientIp}`)) {
+    return jsonResponse({ success: false, error: 'Too many requests' }, 429, cors);
   }
 
   if (!FB_ACCESS_TOKEN) {
