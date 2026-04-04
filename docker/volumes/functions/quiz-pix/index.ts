@@ -26,7 +26,7 @@ const ALLOWED_ORIGINS = (Deno.env.get('ALLOWED_ORIGINS') ?? '').split(',').map(s
 
 function getCorsHeaders(req: Request) {
   const origin = req.headers.get('origin') ?? '';
-  const allowed = ALLOWED_ORIGINS.length === 0 || ALLOWED_ORIGINS.includes(origin);
+  const allowed = isOriginAllowed(req);
   return {
     'Access-Control-Allow-Origin': allowed ? origin : ALLOWED_ORIGINS[0] ?? '',
     'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
@@ -40,7 +40,17 @@ function isOriginAllowed(req: Request) {
   }
 
   const origin = req.headers.get('origin') ?? '';
-  return ALLOWED_ORIGINS.includes(origin);
+  if (ALLOWED_ORIGINS.includes(origin)) return true;
+
+  // Allow any *.maisfloresta.cloud subdomain and Lovable preview domains
+  try {
+    const host = new URL(origin).hostname;
+    if (host.endsWith('.maisfloresta.cloud') || host.endsWith('.lovable.app') || host.endsWith('.lovableproject.com')) {
+      return true;
+    }
+  } catch { /* invalid origin */ }
+
+  return false;
 }
 
 // ── Rate limiter (per order code / per IP, per instance) ──
