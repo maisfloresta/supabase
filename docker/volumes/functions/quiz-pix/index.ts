@@ -1085,9 +1085,13 @@ async function checkPixStatus(pixId: string) {
     abacatepay: chargeData,
   });
 
+  // Never regress a terminal payment status (paid, refunded, etc.) back to pending
+  const terminalStatuses = ['paid', 'refunded', 'disputed'];
+  const alreadyTerminal = currentOrder && terminalStatuses.includes(currentOrder.payment_status);
+
   const updatePayload: Record<string, unknown> = {
-    payment_status: mapped.paymentStatus,
-    order_status: mapped.orderStatus,
+    payment_status: alreadyTerminal ? currentOrder.payment_status : mapped.paymentStatus,
+    order_status: alreadyTerminal ? currentOrder.payment_status : mapped.orderStatus,
     dev_mode: Boolean(chargeData.devMode),
     provider_response: mergedProviderResponse,
   };
