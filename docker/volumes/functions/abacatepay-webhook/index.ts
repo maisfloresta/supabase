@@ -182,12 +182,15 @@ Deno.serve(async (req) => {
     const transparentId = parsed.transparentId;
     const metadataQuizOrderId = firstNumber([parsed.metadata.quizOrderId]);
     const metadataQuizOrderCode = firstString([parsed.metadata.quizOrderCode]);
+    const metadataSproutOrderId = firstString([parsed.metadata.sproutOrderId]);
+    const metadataSproutOrderCode = firstString([parsed.metadata.sproutOrderCode]);
+    const metadataSource = firstString([parsed.metadata.source]);
 
     console.log(
-      `[abacatepay-webhook] Received event=${event || 'unknown'} transparent_id=${transparentId ?? 'missing'} order_code=${metadataQuizOrderCode ?? 'missing'} order_id=${metadataQuizOrderId ?? 'missing'}`,
+      `[abacatepay-webhook] Received event=${event || 'unknown'} transparent_id=${transparentId ?? 'missing'} order_code=${metadataQuizOrderCode ?? metadataSproutOrderCode ?? 'missing'} order_id=${metadataQuizOrderId ?? metadataSproutOrderId ?? 'missing'} source=${metadataSource ?? 'unknown'}`,
     );
 
-    if (!transparentId && !metadataQuizOrderId && !metadataQuizOrderCode) {
+    if (!transparentId && !metadataQuizOrderId && !metadataQuizOrderCode && !metadataSproutOrderId && !metadataSproutOrderCode) {
       console.error('[abacatepay-webhook] No order identifier found in payload');
       return jsonResponse({ success: true, message: 'No ID to process' });
     }
@@ -255,10 +258,32 @@ Deno.serve(async (req) => {
       order = lookup.data;
     }
 
+    // Fallback: search in sprout_orders if not found in quiz_orders
+    const SELECT_COLS = 'id, order_code, transparent_id, payment_status, customer_name, customer_phone, customer_cpf, selected_color, items, total_cents, freight_cents, free_shipping, has_gift, shipping_cep, shipping_street, shipping_number, shipping_complement, shipping_neighborhood, shipping_city, shipping_state, provider_response, logistics_webhook_sent_at';
+    let orderTable = 'quiz_orders';
+
     if (!order) {
-      console.log(`[abacatepay-webhook] No order found for transparent_id=${transparentId ?? 'missing'} order_code=${metadataQuizOrderCode ?? 'missing'} order_id=${metadataQuizOrderId ?? 'missing'}`);
+      if (transparentId) {
+        const lookup = await admin.from('sprout_orders').select(SELECT_COLS).eq('transparent_id', transparentId).maybeSingle();
+        order = lookup.data;
+      }
+      if (!order && metadataSproutOrderId) {
+        const lookup = await admin.from('sprout_orders').select(SELECT_COLS).eq('id', metadataSproutOrderId).maybeSingle();
+        order = lookup.data;
+      }
+      if (!order && metadataSproutOrderCode) {
+        const lookup = await admin.from('sprout_orders').select(SELECT_COLS).eq('order_code', metadataSproutOrderCode).maybeSingle();
+        order = lookup.data;
+      }
+      if (order) orderTable = 'sprout_orders';
+    }
+
+    if (!order) {
+      console.log(`[abacatepay-webhook] No order found for transparent_id=${transparentId ?? 'missing'} order_code=${metadataQuizOrderCode ?? metadataSproutOrderCode ?? 'missing'} order_id=${metadataQuizOrderId ?? metadataSproutOrderId ?? 'missing'}`);
       return jsonResponse({ success: true, message: 'Order not found' });
     }
+
+    console.log(`[abacatepay-webhook] Found order ${order.order_code} in ${orderTable}`);
 
     const wasPaid = order.payment_status === 'paid';
 
@@ -292,11 +317,11 @@ Deno.serve(async (req) => {
     }
 
     await admin
-      .from('quiz_orders')
+      .from(orderTable)
       .update(updatePayload)
       .eq('id', order.id);
 
-    console.log(`[abacatepay-webhook] Order ${order.order_code} updated: ${order.payment_status} -> ${mapped.paymentStatus}`);
+    console.log(`[abacatepay-webhook] Order ${order.order_code} updated in ${orderTable}: ${order.payment_status} -> ${mapped.paymentStatus}`);
 
     if (mapped.paymentStatus === 'paid') {
       if (!wasPaid) {
@@ -327,7 +352,7 @@ Deno.serve(async (req) => {
             });
 
             await admin
-              .from('quiz_orders')
+              .from(orderTable)
               .update({
                 provider_response: mergeStoredMetaPurchaseStatus({
                   ...existingProviderResponse,
@@ -347,7 +372,7 @@ Deno.serve(async (req) => {
             console.error('[abacatepay-webhook] Meta purchase sync failed:', message);
 
             await admin
-              .from('quiz_orders')
+              .from(orderTable)
               .update({
                 provider_response: mergeStoredMetaPurchaseStatus({
                   ...existingProviderResponse,
@@ -363,13 +388,16 @@ Deno.serve(async (req) => {
           }
         }
 
-        const n8nPaidUrl = Deno.env.get('N8N_PIX_PAID_WEBHOOK_URL');
+        const n8nPaidUrl = orderTable === 'sprout_orders'
+          ? (Deno.env.get('SPROUT_N8N_PIX_PAID_WEBHOOK_URL') || Deno.env.get('N8N_PIX_PAID_WEBHOOK_URL'))
+          : Deno.env.get('N8N_PIX_PAID_WEBHOOK_URL');
         if (n8nPaidUrl) {
           fetch(n8nPaidUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               event: 'pix_paid',
+              source: orderTable === 'sprout_orders' ? 'sprout' : 'quiz',
               orderCode: order.order_code,
               customerName: order.customer_name,
               customerPhone: order.customer_phone,
@@ -380,34 +408,37 @@ Deno.serve(async (req) => {
         }
       }
 
-      await syncQuizLogisticsForOrder(admin, {
-        id: order.id,
-        order_code: order.order_code,
-        customer_name: order.customer_name,
-        customer_phone: order.customer_phone,
-        customer_cpf: order.customer_cpf,
-        selected_color: order.selected_color,
-        items: order.items,
-        total_cents: order.total_cents,
-        freight_cents: order.freight_cents,
-        free_shipping: order.free_shipping,
-        has_gift: order.has_gift,
-        shipping_cep: order.shipping_cep,
-        shipping_street: order.shipping_street,
-        shipping_number: order.shipping_number,
-        shipping_complement: order.shipping_complement,
-        shipping_neighborhood: order.shipping_neighborhood,
-        shipping_city: order.shipping_city,
-        shipping_state: order.shipping_state,
-        provider_response: {
-          ...existingProviderResponse,
-          abacatepay: latestAbacatepaySnapshot,
-          abacatepay_webhook: body,
-        },
-        logistics_webhook_sent_at: order.logistics_webhook_sent_at,
-      }, {
-        source: 'abacatepay-webhook',
-      });
+      // Logistics sync only for quiz_orders (sprout uses its own logistics via N8N)
+      if (orderTable === 'quiz_orders') {
+        await syncQuizLogisticsForOrder(admin, {
+          id: order.id,
+          order_code: order.order_code,
+          customer_name: order.customer_name,
+          customer_phone: order.customer_phone,
+          customer_cpf: order.customer_cpf,
+          selected_color: order.selected_color,
+          items: order.items,
+          total_cents: order.total_cents,
+          freight_cents: order.freight_cents,
+          free_shipping: order.free_shipping,
+          has_gift: order.has_gift,
+          shipping_cep: order.shipping_cep,
+          shipping_street: order.shipping_street,
+          shipping_number: order.shipping_number,
+          shipping_complement: order.shipping_complement,
+          shipping_neighborhood: order.shipping_neighborhood,
+          shipping_city: order.shipping_city,
+          shipping_state: order.shipping_state,
+          provider_response: {
+            ...existingProviderResponse,
+            abacatepay: latestAbacatepaySnapshot,
+            abacatepay_webhook: body,
+          },
+          logistics_webhook_sent_at: order.logistics_webhook_sent_at,
+        }, {
+          source: 'abacatepay-webhook',
+        });
+      }
     }
 
     return jsonResponse({ success: true, status: mapped.paymentStatus });
