@@ -258,10 +258,28 @@ Deno.serve(async (req) => {
       order = lookup.data;
     }
 
-    // Fallback: search in sprout_orders if not found in quiz_orders
+    // Fallback: search in gwq_orders, then sprout_orders
     const SELECT_COLS = 'id, order_code, transparent_id, payment_status, customer_name, customer_phone, customer_cpf, selected_color, items, total_cents, freight_cents, free_shipping, has_gift, shipping_cep, shipping_street, shipping_number, shipping_complement, shipping_neighborhood, shipping_city, shipping_state, provider_response, logistics_webhook_sent_at';
     let orderTable = 'quiz_orders';
 
+    // Try gwq_orders (grow-with-quiz) — uses same quizOrderId/quizOrderCode metadata keys
+    if (!order) {
+      if (transparentId) {
+        const lookup = await admin.from('gwq_orders').select(SELECT_COLS).eq('transparent_id', transparentId).maybeSingle();
+        order = lookup.data;
+      }
+      if (!order && metadataQuizOrderId !== null) {
+        const lookup = await admin.from('gwq_orders').select(SELECT_COLS).eq('id', metadataQuizOrderId).maybeSingle();
+        order = lookup.data;
+      }
+      if (!order && metadataQuizOrderCode) {
+        const lookup = await admin.from('gwq_orders').select(SELECT_COLS).eq('order_code', metadataQuizOrderCode).maybeSingle();
+        order = lookup.data;
+      }
+      if (order) orderTable = 'gwq_orders';
+    }
+
+    // Try sprout_orders
     if (!order) {
       if (transparentId) {
         const lookup = await admin.from('sprout_orders').select(SELECT_COLS).eq('transparent_id', transparentId).maybeSingle();
@@ -390,14 +408,16 @@ Deno.serve(async (req) => {
 
         const n8nPaidUrl = orderTable === 'sprout_orders'
           ? (Deno.env.get('SPROUT_N8N_PIX_PAID_WEBHOOK_URL') || Deno.env.get('N8N_PIX_PAID_WEBHOOK_URL'))
-          : Deno.env.get('N8N_PIX_PAID_WEBHOOK_URL');
+          : orderTable === 'gwq_orders'
+            ? (Deno.env.get('GWQ_N8N_PIX_PAID_WEBHOOK_URL') || Deno.env.get('N8N_PIX_PAID_WEBHOOK_URL'))
+            : Deno.env.get('N8N_PIX_PAID_WEBHOOK_URL');
         if (n8nPaidUrl) {
           fetch(n8nPaidUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               event: 'pix_paid',
-              source: orderTable === 'sprout_orders' ? 'sprout' : 'quiz',
+              source: orderTable.replace('_orders', ''),
               orderCode: order.order_code,
               customerName: order.customer_name,
               customerPhone: order.customer_phone,
@@ -408,7 +428,7 @@ Deno.serve(async (req) => {
         }
       }
 
-      // Logistics sync only for quiz_orders (sprout uses its own logistics via N8N)
+      // Logistics sync only for quiz_orders (shared module hardcodes quiz_orders table)
       if (orderTable === 'quiz_orders') {
         await syncQuizLogisticsForOrder(admin, {
           id: order.id,
