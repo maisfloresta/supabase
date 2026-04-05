@@ -473,9 +473,10 @@ interface AppmaxMerchantCredentials {
   clientSecret: string;
 }
 
-function validateAndCalculateCart(cart: CartInput) {
+function validateAndCalculateCart(cart: CartInput, selectedColor?: string) {
   const lineItems: LineItem[] = [];
   let subtotalCents = 0;
+  let upsellCount = 0;
 
   for (const [key, optionIndex] of Object.entries(cart)) {
     if (optionIndex === null || optionIndex === undefined) continue;
@@ -495,14 +496,32 @@ function validateAndCalculateCart(cart: CartInput) {
       totalCents: option.priceCents,
     });
     subtotalCents += option.priceCents;
+    upsellCount++;
   }
 
-  if (lineItems.length === 0) {
-    throw new Error('Nenhum item selecionado.');
-  }
+  // Always include base items (free seeds + personalized manual)
+  const colorLabel = selectedColor || 'Amarelo';
+  lineItems.unshift(
+    {
+      productId: 100,
+      name: `Sementes de Ipê ${colorLabel}`,
+      optionLabel: `10 sementes de Ipê ${colorLabel}`,
+      quantity: 1,
+      unitPriceCents: 0,
+      totalCents: 0,
+    },
+    {
+      productId: 101,
+      name: 'Manual de Plantio Personalizado',
+      optionLabel: 'Manual de plantio personalizado',
+      quantity: 1,
+      unitPriceCents: 0,
+      totalCents: 0,
+    },
+  );
 
   const hasGift = subtotalCents >= GIFT_THRESHOLD_CENTS;
-  const freeShipping = lineItems.length === 3;
+  const freeShipping = upsellCount === 3;
   const freightCents = freeShipping ? 0 : FREIGHT_CENTS;
   const totalCents = subtotalCents + freightCents;
 
@@ -918,7 +937,7 @@ async function notifyPixSelection(orderCode: string) {
 
 async function createPixCharge(input: CreateInput, requestContext: RequestContext) {
   const admin = createAdminClient();
-  const { lineItems, subtotalCents, totalCents, freightCents, hasGift, freeShipping } = validateAndCalculateCart(input.cart);
+  const { lineItems, subtotalCents, totalCents, freightCents, hasGift, freeShipping } = validateAndCalculateCart(input.cart, input.selectedColor);
   const orderCode = buildOrderCode();
 
   // Validate shipping
