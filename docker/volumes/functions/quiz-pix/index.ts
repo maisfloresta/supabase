@@ -1015,6 +1015,11 @@ async function createPixCharge(input: CreateInput, requestContext: RequestContex
       })
       .eq('order_code', orderCode);
 
+    // Fire-and-forget: notify n8n for WhatsApp follow-up
+    notifyPixSelection(orderCode).catch((err) => {
+      console.error('[quiz-pix] Background PIX notification failed:', err);
+    });
+
     const card = await cardConfigPromise;
 
     return {
