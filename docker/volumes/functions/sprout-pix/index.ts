@@ -1034,10 +1034,8 @@ async function createPixCharge(input: CreateInput, requestContext: RequestContex
       })
       .eq('order_code', orderCode);
 
-    // Fire-and-forget: notify n8n for WhatsApp follow-up
-    notifyPixSelection(orderCode).catch((err) => {
-      console.error('[sprout-pix] Background PIX notification failed:', err);
-    });
+    // PIX notification is now sent only when the user explicitly selects PIX
+    // (via the PIX_SELECTED action), not during charge creation.
 
     const card = await cardConfigPromise;
 
