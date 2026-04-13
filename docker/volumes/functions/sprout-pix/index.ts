@@ -14,7 +14,10 @@ const ABACATEPAY_API_URL = 'https://api.abacatepay.com';
 const APPMAX_API_URL = Deno.env.get('APPMAX_API_URL') ?? 'https://api.appmax.com.br';
 const APPMAX_AUTH_URL = Deno.env.get('APPMAX_AUTH_URL') ?? 'https://auth.appmax.com.br/oauth2/token';
 const APPMAX_EXTERNAL_KEY = (Deno.env.get('APPMAX_DEFAULT_EXTERNAL_KEY') ?? 'quiz.maisfloresta.cloud').trim();
+// Canonical UUID app_id (preferido). Legado: APPMAX_VALIDATION_APP_ID (numérico).
+const APPMAX_APP_ID = Deno.env.get('APPMAX_APP_ID')?.trim() || null;
 const APPMAX_VALIDATION_APP_ID = Deno.env.get('APPMAX_VALIDATION_APP_ID')?.trim() || null;
+const APPMAX_INSTALLATION_APP_ID = APPMAX_APP_ID || APPMAX_VALIDATION_APP_ID;
 const APPMAX_SOFT_DESCRIPTOR = (Deno.env.get('APPMAX_SOFT_DESCRIPTOR') ?? 'MAISFLORESTA').slice(0, 13);
 const CHECKOUT_DESCRIPTION = 'Sprout Discovery - Mais Floresta';
 const CHECKOUT_EXPIRATION_SECONDS = 60 * 60; // 1 hour
@@ -612,6 +615,37 @@ async function appmaxAuthRequest(credentials: AppmaxMerchantCredentials) {
   return accessToken;
 }
 
+function extractAppmaxErrorMessage(payload: unknown): string | null {
+  if (!isRecord(payload)) return null;
+
+  const direct = firstString([
+    (payload as any).error,
+    (payload as any).error_description,
+    (payload as any).message,
+  ]);
+  if (direct) return direct;
+
+  const errors = (payload as any).errors;
+  if (Array.isArray(errors) && errors.length > 0) {
+    const first = errors[0];
+    if (typeof first === 'string') return first;
+    if (isRecord(first)) {
+      const nested = firstString([first.message, first.error, first.detail]);
+      if (nested) return nested;
+    }
+  }
+  if (isRecord(errors)) {
+    for (const value of Object.values(errors)) {
+      if (Array.isArray(value) && value.length > 0 && typeof value[0] === 'string') {
+        return value[0];
+      }
+      if (typeof value === 'string') return value;
+    }
+  }
+
+  return null;
+}
+
 async function appmaxApiRequest(path: string, init: RequestInit, accessToken: string) {
   const response = await fetch(`${APPMAX_API_URL}${path}`, {
     ...init,
@@ -625,18 +659,103 @@ async function appmaxApiRequest(path: string, init: RequestInit, accessToken: st
 
   const payload = await response.json().catch(() => null);
 
-  console.error(`[Appmax] ${path} -> status=${response.status} summary=${JSON.stringify(summarizeAppmaxLogPayload(payload))}`);
+  if (response.ok) {
+    console.log(`[Appmax] ${path} -> status=${response.status} summary=${JSON.stringify(summarizeAppmaxLogPayload(payload))}`);
+  } else {
+    console.error(`[Appmax] ${path} FAIL status=${response.status} body=${JSON.stringify(payload)}`);
+  }
 
   if (!response.ok) {
-    const msg = firstString([
-      (payload as any)?.error,
-      (payload as any)?.message,
-      (payload as any)?.errors?.[0],
-    ]) ?? 'Falha ao comunicar com a Appmax.';
+    const msg = extractAppmaxErrorMessage(payload) ?? 'Falha ao comunicar com a Appmax.';
     throw new Error(msg);
   }
 
   return payload;
+}
+
+function normalizeCardNumber(raw: string) {
+  const digits = digitsOnly(raw);
+  if (digits.length < 13 || digits.length > 19) {
+    throw new Error('Número do cartão inválido.');
+  }
+  return digits;
+}
+
+function normalizeCvv(raw: string) {
+  const digits = digitsOnly(raw);
+  if (digits.length < 3 || digits.length > 4) {
+    throw new Error('CVV inválido.');
+  }
+  return digits;
+}
+
+function normalizeExpMonth(raw: string) {
+  const digits = digitsOnly(raw).slice(0, 2);
+  const padded = digits.length === 1 ? `0${digits}` : digits;
+  if (!/^(0[1-9]|1[0-2])$/.test(padded)) {
+    throw new Error('Mês de expiração inválido.');
+  }
+  return padded;
+}
+
+function normalizeExpYear(raw: string) {
+  const digits = digitsOnly(raw);
+  if (digits.length !== 2 && digits.length !== 4) {
+    throw new Error('Ano de expiração inválido.');
+  }
+  return digits.slice(-2);
+}
+
+function normalizeHolderName(raw: string) {
+  const trimmed = String(raw ?? '').trim().replace(/\s+/g, ' ');
+  if (trimmed.length < 3) {
+    throw new Error('Nome do titular inválido.');
+  }
+  return trimmed.slice(0, 100);
+}
+
+async function tokenizeAppmaxCard(
+  accessToken: string,
+  card: {
+    number: string;
+    cvv: string;
+    expirationMonth: string;
+    expirationYear: string;
+    holderName: string;
+  },
+) {
+  const tokenizePayload = await appmaxApiRequest(
+    '/v1/payments/tokenize',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        payment_data: {
+          credit_card: {
+            number: card.number,
+            cvv: card.cvv,
+            expiration_month: card.expirationMonth,
+            expiration_year: card.expirationYear,
+            holder_name: card.holderName,
+          },
+        },
+      }),
+    },
+    accessToken,
+  );
+
+  const token = firstString([
+    findValueByKeys(tokenizePayload, ['token']),
+    findValueByKeys(tokenizePayload, ['card_token']),
+    findValueByKeys(tokenizePayload, ['credit_card_token']),
+    findValueByKeys(tokenizePayload, ['id']),
+  ]);
+
+  if (!token) {
+    console.error('[Appmax] tokenize OK mas token ausente:', JSON.stringify(tokenizePayload));
+    throw new Error('A Appmax não retornou um token de cartão válido.');
+  }
+
+  return { token, payload: tokenizePayload };
 }
 
 async function getLatestAppmaxInstallation(admin: ReturnType<typeof createAdminClient>) {
@@ -648,8 +767,8 @@ async function getLatestAppmaxInstallation(admin: ReturnType<typeof createAdminC
     .order('created_at', { ascending: false })
     .limit(1);
 
-  if (APPMAX_VALIDATION_APP_ID) {
-    query = query.eq('app_id', APPMAX_VALIDATION_APP_ID);
+  if (APPMAX_INSTALLATION_APP_ID) {
+    query = query.eq('app_id', APPMAX_INSTALLATION_APP_ID);
   }
 
   const { data, error } = await query.maybeSingle<AppmaxInstallationRow>();
@@ -725,7 +844,10 @@ interface CreateInput {
 
 interface CardPaymentInput {
   orderCode: string;
-  token: string;
+  cardNumber: string;
+  cardCvv: string;
+  cardExpirationMonth: string;
+  cardExpirationYear: string;
   holderName: string;
   holderDocumentNumber: string;
   installments: number;
@@ -954,6 +1076,7 @@ async function createPixCharge(input: CreateInput, requestContext: RequestContex
       customer_name: input.customerName,
       customer_phone: input.customerPhone,
       customer_cpf: input.customerCpf,
+      customer_email: input.customerEmail ?? '',
       customer_region: input.customerRegion ?? null,
       selected_color: input.selectedColor ?? null,
       quiz_answers: input.quizAnswers ?? {},
@@ -1200,18 +1323,16 @@ async function processCardPayment(input: CardPaymentInput) {
     throw new Error('Pedido inválido.');
   }
 
-  if (!input.token.trim()) {
-    throw new Error('Token do cartão inválido.');
-  }
-
-  if (!input.holderName.trim()) {
-    throw new Error('Nome do titular é obrigatório.');
-  }
-
+  const holderName = normalizeHolderName(input.holderName);
   const holderDocumentNumber = digitsOnly(input.holderDocumentNumber);
-  if (holderDocumentNumber.length !== 11) {
+  if (holderDocumentNumber.length !== 11 || !isValidCpf(holderDocumentNumber)) {
     throw new Error('CPF do titular inválido.');
   }
+
+  const cardNumber = normalizeCardNumber(input.cardNumber);
+  const cardCvv = normalizeCvv(input.cardCvv);
+  const cardExpirationMonth = normalizeExpMonth(input.cardExpirationMonth);
+  const cardExpirationYear = normalizeExpYear(input.cardExpirationYear);
 
   if (!Number.isInteger(input.installments) || input.installments < 1 || input.installments > APPMAX_MAX_INSTALLMENTS) {
     throw new Error('Parcelamento inválido.');
@@ -1225,6 +1346,7 @@ async function processCardPayment(input: CardPaymentInput) {
       customer_name,
       customer_phone,
       customer_cpf,
+      customer_email,
       selected_color,
       total_cents,
       freight_cents,
@@ -1317,7 +1439,12 @@ async function processCardPayment(input: CardPaymentInput) {
   };
 
   const { firstName, lastName } = splitCustomerName(order.customer_name);
-  const customerEmail = `${digitsOnly(order.customer_cpf)}@cliente.maisfloresta.cloud`;
+  const realEmail = (order.customer_email ? String(order.customer_email).trim() : '') ||
+    (isRecord(order.provider_response) && isRecord((order.provider_response as any).meta_tracking)
+      ? String(((order.provider_response as any).meta_tracking.customer_email
+          ?? (order.provider_response as any).meta_tracking.customerEmail) ?? '').trim()
+      : '');
+  const customerEmail = realEmail || `${digitsOnly(order.customer_cpf)}@cliente.maisfloresta.cloud`;
   const customerIp = input.customerIp?.trim() || undefined;
   const appmaxProducts = buildAppmaxProducts(lineItems);
   const baseTotalCents = Number(order.total_cents);
@@ -1385,6 +1512,15 @@ async function processCardPayment(input: CardPaymentInput) {
     throw new Error('A Appmax não retornou o order_id do pedido.');
   }
 
+  // Tokenização server-side via API oficial (não usa AppmaxJS / endpoint AWS interno)
+  const { token: cardToken, payload: tokenizePayload } = await tokenizeAppmaxCard(accessToken, {
+    number: cardNumber,
+    cvv: cardCvv,
+    expirationMonth: cardExpirationMonth,
+    expirationYear: cardExpirationYear,
+    holderName,
+  });
+
   const paymentPayload = await appmaxApiRequest(
     '/v1/payments/credit-card',
     {
@@ -1394,9 +1530,9 @@ async function processCardPayment(input: CardPaymentInput) {
         customer_id: customerId,
         payment_data: {
           credit_card: {
-            token: input.token.trim(),
+            token: cardToken,
             holder_document_number: holderDocumentNumber,
-            holder_name: input.holderName.trim(),
+            holder_name: holderName,
             installments: input.installments,
             soft_descriptor: APPMAX_SOFT_DESCRIPTOR,
           },
@@ -1422,6 +1558,7 @@ async function processCardPayment(input: CardPaymentInput) {
       installment_fee_cents: installmentFeeCents,
       customer: customerPayload,
       order: orderPayload,
+      tokenize: tokenizePayload,
       payment: paymentPayload,
       payment_id: appmaxPaymentId,
       status: appmaxStatus,
@@ -1657,11 +1794,14 @@ Deno.serve(async (req) => {
 
       const data = await processCardPayment({
         orderCode,
-        token: String(body.token ?? ''),
+        cardNumber: String(body.cardNumber ?? ''),
+        cardCvv: String(body.cardCvv ?? ''),
+        cardExpirationMonth: String(body.cardExpirationMonth ?? ''),
+        cardExpirationYear: String(body.cardExpirationYear ?? ''),
         holderName: String(body.holderName ?? '').trim().slice(0, 100),
         holderDocumentNumber: String(body.holderDocumentNumber ?? ''),
         installments: Number(body.installments ?? 0),
-        customerIp: body.customerIp ? String(body.customerIp).trim().slice(0, 45) : undefined,
+        customerIp: requestContext.clientIp?.slice(0, 45) || undefined,
       });
       return jsonResponse({ success: true, data });
     }
@@ -1677,10 +1817,14 @@ Deno.serve(async (req) => {
       'Telefone inválido.',
       'Nome inválido.',
       'Pedido inválido.',
-      'Token do cartão inválido.',
-      'Nome do titular é obrigatório.',
+      'Número do cartão inválido.',
+      'CVV inválido.',
+      'Mês de expiração inválido.',
+      'Ano de expiração inválido.',
+      'Nome do titular inválido.',
       'CPF do titular inválido.',
       'Parcelamento inválido.',
+      'A Appmax não retornou um token de cartão válido.',
       'Pedido não encontrado.',
       'ID do PIX inválido.',
       'Pedido sem itens.',
