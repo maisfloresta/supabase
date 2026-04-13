@@ -614,10 +614,17 @@ async function appmaxApiRequest(path: string, init: RequestInit, accessToken: st
   console.error(`[Appmax] ${path} -> status=${response.status} summary=${JSON.stringify(summarizeAppmaxLogPayload(payload))}`);
 
   if (!response.ok) {
+    console.error(`[Appmax] ${path} FULL error body: ${JSON.stringify(payload)}`);
+    const errorsField = (payload as any)?.errors;
     const msg = firstString([
       (payload as any)?.error,
       (payload as any)?.message,
-      (payload as any)?.errors?.[0],
+      Array.isArray(errorsField) ? errorsField[0] : null,
+      errorsField && typeof errorsField === 'object'
+        ? (Array.isArray(Object.values(errorsField)[0])
+          ? (Object.values(errorsField)[0] as unknown[])[0] as string
+          : String(Object.values(errorsField)[0] ?? ''))
+        : null,
     ]) ?? 'Falha ao comunicar com a Appmax.';
     throw new Error(msg);
   }
@@ -1757,7 +1764,9 @@ Deno.serve(async (req) => {
         holderName: String(body.holderName ?? '').trim().slice(0, 100),
         holderDocumentNumber: String(body.holderDocumentNumber ?? ''),
         installments: Number(body.installments ?? 0),
-        customerIp: body.customerIp ? String(body.customerIp).trim().slice(0, 45) : undefined,
+        customerIp: (body.customerIp
+          ? String(body.customerIp).trim().slice(0, 45)
+          : requestContext.clientIp?.slice(0, 45)) || undefined,
       });
       return jsonResponse({ success: true, data });
     }
