@@ -14,7 +14,12 @@ const ABACATEPAY_API_URL = 'https://api.abacatepay.com';
 const APPMAX_API_URL = Deno.env.get('APPMAX_API_URL') ?? 'https://api.appmax.com.br';
 const APPMAX_AUTH_URL = Deno.env.get('APPMAX_AUTH_URL') ?? 'https://auth.appmax.com.br/oauth2/token';
 const APPMAX_EXTERNAL_KEY = (Deno.env.get('APPMAX_DEFAULT_EXTERNAL_KEY') ?? 'quiz.maisfloresta.cloud').trim();
-const APPMAX_VALIDATION_APP_ID = Deno.env.get('APPMAX_VALIDATION_APP_ID')?.trim() || null;
+// The canonical Appmax App ID (UUID). Falls back to the legacy numeric
+// APPMAX_VALIDATION_APP_ID only if APPMAX_APP_ID is not set, so stale
+// installation rows bound to the old numeric app_id are ignored.
+const APPMAX_APP_ID = (Deno.env.get('APPMAX_APP_ID')?.trim())
+  || (Deno.env.get('APPMAX_VALIDATION_APP_ID')?.trim())
+  || null;
 const APPMAX_SOFT_DESCRIPTOR = (Deno.env.get('APPMAX_SOFT_DESCRIPTOR') ?? 'MAISFLORESTA').slice(0, 13);
 const CHECKOUT_DESCRIPTION = 'Grow With Quiz - Mais Floresta';
 const CHECKOUT_EXPIRATION_SECONDS = 60 * 60;
@@ -536,19 +541,39 @@ async function appmaxApiRequest(path: string, init: RequestInit, accessToken: st
     },
   });
 
-  const payload = await response.json().catch(() => null);
-
-  console.error(`[Appmax] ${path} -> status=${response.status} summary=${JSON.stringify(summarizeAppmaxLogPayload(payload))}`);
-
-  if (!response.ok) {
-    const msg = firstString([
-      (payload as any)?.error,
-      (payload as any)?.message,
-      (payload as any)?.errors?.[0],
-    ]) ?? 'Falha ao comunicar com a Appmax.';
-    throw new Error(msg);
+  const rawText = await response.text();
+  let payload: unknown = null;
+  try {
+    payload = rawText ? JSON.parse(rawText) : null;
+  } catch {
+    payload = rawText;
   }
 
+  if (!response.ok) {
+    console.error(`[Appmax] ${path} -> status=${response.status} FULL error body: ${rawText}`);
+    let msg = firstString([
+      (payload as any)?.error,
+      (payload as any)?.error_description,
+      (payload as any)?.message,
+      (payload as any)?.detail,
+      Array.isArray((payload as any)?.errors) ? (payload as any).errors[0] : null,
+    ]);
+    const errorsField = (payload as any)?.errors;
+    if (!msg && errorsField && typeof errorsField === 'object' && !Array.isArray(errorsField)) {
+      const firstKey = Object.keys(errorsField)[0];
+      const firstVal = firstKey ? errorsField[firstKey] : null;
+      msg = Array.isArray(firstVal) ? firstVal[0] : typeof firstVal === 'string' ? firstVal : null;
+    }
+    if (!msg && (payload as any)?.error && typeof (payload as any).error === 'object') {
+      msg = firstString([
+        ((payload as any).error as any).message,
+        ((payload as any).error as any).description,
+      ]);
+    }
+    throw new Error(msg || `Falha ao comunicar com a Appmax (HTTP ${response.status}).`);
+  }
+
+  console.error(`[Appmax] ${path} -> status=${response.status} summary=${JSON.stringify(summarizeAppmaxLogPayload(payload))}`);
   return payload;
 }
 
@@ -561,8 +586,8 @@ async function getLatestAppmaxInstallation(admin: ReturnType<typeof createAdminC
     .order('created_at', { ascending: false })
     .limit(1);
 
-  if (APPMAX_VALIDATION_APP_ID) {
-    query = query.eq('app_id', APPMAX_VALIDATION_APP_ID);
+  if (APPMAX_APP_ID) {
+    query = query.eq('app_id', APPMAX_APP_ID);
   }
 
   const { data, error } = await query.maybeSingle<AppmaxInstallationRow>();
