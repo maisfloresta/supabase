@@ -636,7 +636,11 @@ interface CreateInput {
 
 interface CardPaymentInput {
   orderCode: string;
-  token: string;
+  cardNumber: string;
+  cardHolderName: string;
+  cardExpirationMonth: string;
+  cardExpirationYear: string;
+  cardCvv: string;
   holderName: string;
   holderDocumentNumber: string;
   installments: number;
@@ -1075,7 +1079,35 @@ async function processCardPayment(input: CardPaymentInput) {
   const admin = createAdminClient();
 
   if (!input.orderCode.trim()) throw new Error('Pedido inválido.');
-  if (!input.token.trim()) throw new Error('Token do cartão inválido.');
+
+  const cardNumberDigits = digitsOnly(input.cardNumber);
+  if (cardNumberDigits.length < 13 || cardNumberDigits.length > 19) {
+    throw new Error('Número do cartão inválido.');
+  }
+
+  const cardExpirationMonth = digitsOnly(input.cardExpirationMonth).padStart(2, '0');
+  if (!/^(0[1-9]|1[0-2])$/.test(cardExpirationMonth)) {
+    throw new Error('Mês de validade inválido.');
+  }
+
+  const cardExpirationYearDigits = digitsOnly(input.cardExpirationYear);
+  if (cardExpirationYearDigits.length !== 2 && cardExpirationYearDigits.length !== 4) {
+    throw new Error('Ano de validade inválido.');
+  }
+  const cardExpirationYear = cardExpirationYearDigits.length === 4
+    ? cardExpirationYearDigits.slice(-2)
+    : cardExpirationYearDigits;
+
+  const cardCvv = digitsOnly(input.cardCvv);
+  if (cardCvv.length < 3 || cardCvv.length > 4) {
+    throw new Error('CVV inválido.');
+  }
+
+  const cardHolderNameForToken = (input.cardHolderName || input.holderName).trim();
+  if (cardHolderNameForToken.length < 3) {
+    throw new Error('Nome impresso no cartão é obrigatório.');
+  }
+
   if (!input.holderName.trim()) throw new Error('Nome do titular é obrigatório.');
 
   const holderDocumentNumber = digitsOnly(input.holderDocumentNumber);
@@ -1208,6 +1240,36 @@ async function processCardPayment(input: CardPaymentInput) {
   ]);
   if (!appmaxOrderId) throw new Error('A Appmax não retornou o order_id do pedido.');
 
+  const tokenizePayload = await appmaxApiRequest(
+    '/v1/payments/tokenize',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        payment_data: {
+          credit_card: {
+            number: cardNumberDigits,
+            cvv: cardCvv,
+            expiration_month: cardExpirationMonth,
+            expiration_year: cardExpirationYear,
+            holder_name: cardHolderNameForToken,
+          },
+        },
+      }),
+    },
+    accessToken,
+  );
+
+  const cardToken = firstString([
+    findValueByKeys(tokenizePayload, ['token']),
+    findValueByKeys(tokenizePayload, ['card_token']),
+    findValueByKeys(tokenizePayload, ['credit_card_token']),
+    findValueByKeys(tokenizePayload, ['id']),
+  ]);
+
+  if (!cardToken) {
+    throw new Error('A Appmax não retornou o token do cartão.');
+  }
+
   const paymentPayload = await appmaxApiRequest(
     '/v1/payments/credit-card',
     {
@@ -1216,7 +1278,7 @@ async function processCardPayment(input: CardPaymentInput) {
         order_id: appmaxOrderId, customer_id: customerId,
         payment_data: {
           credit_card: {
-            token: input.token.trim(),
+            token: cardToken,
             holder_document_number: holderDocumentNumber,
             holder_name: input.holderName.trim(),
             installments: input.installments,
@@ -1444,11 +1506,17 @@ Deno.serve(async (req) => {
       }
       const data = await processCardPayment({
         orderCode,
-        token: String(body.token ?? ''),
+        cardNumber: String(body.cardNumber ?? ''),
+        cardHolderName: String(body.cardHolderName ?? '').trim().slice(0, 100),
+        cardExpirationMonth: String(body.cardExpirationMonth ?? ''),
+        cardExpirationYear: String(body.cardExpirationYear ?? ''),
+        cardCvv: String(body.cardCvv ?? ''),
         holderName: String(body.holderName ?? '').trim().slice(0, 100),
         holderDocumentNumber: String(body.holderDocumentNumber ?? ''),
         installments: Number(body.installments ?? 0),
-        customerIp: body.customerIp ? String(body.customerIp).trim().slice(0, 45) : undefined,
+        customerIp: (body.customerIp
+          ? String(body.customerIp).trim().slice(0, 45)
+          : requestContext.clientIp?.slice(0, 45)) || undefined,
       });
       return jsonResponse({ success: true, data });
     }
@@ -1464,9 +1532,18 @@ Deno.serve(async (req) => {
       'Nome inválido.',
       'Pedido inválido.',
       'Token do cartão inválido.',
+      'Número do cartão inválido.',
+      'Mês de validade inválido.',
+      'Ano de validade inválido.',
+      'CVV inválido.',
+      'Nome impresso no cartão é obrigatório.',
       'Nome do titular é obrigatório.',
       'CPF do titular inválido.',
       'Parcelamento inválido.',
+      'A Appmax não retornou o token do cartão.',
+      'A Appmax não retornou o customer_id do cliente.',
+      'A Appmax não retornou o order_id do pedido.',
+      'A instalação Appmax ainda não foi concluída. Finalize a instalação do aplicativo e tente novamente.',
       'Pedido não encontrado.',
       'ID do PIX inválido.',
       'Pedido sem itens.',
