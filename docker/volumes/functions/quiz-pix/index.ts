@@ -1180,6 +1180,33 @@ async function checkPixStatus(pixId: string) {
   };
 }
 
+async function getOrderStatus(orderCode: string) {
+  const admin = createAdminClient();
+  const { data: order, error } = await admin
+    .from('quiz_orders')
+    .select('order_code, transparent_id, payment_method, payment_status, order_status, total_cents, paid_amount_cents, receipt_url, last_error, expires_at')
+    .eq('order_code', orderCode)
+    .maybeSingle();
+
+  if (error || !order) {
+    throw new Error('Pedido não encontrado.');
+  }
+
+  return {
+    orderCode: order.order_code,
+    pixId: order.transparent_id ?? null,
+    paymentMethod: order.payment_method ?? null,
+    paymentStatus: order.payment_status ?? 'pending',
+    orderStatus: order.order_status ?? 'pending',
+    amountCents: Number(order.total_cents ?? 0),
+    paidAmountCents: order.paid_amount_cents ?? null,
+    receiptUrl: order.receipt_url ?? null,
+    lastError: order.last_error ?? null,
+    expiresAt: order.expires_at ?? null,
+    isPaid: order.payment_status === 'paid',
+  };
+}
+
 async function processCardPayment(input: CardPaymentInput) {
   const admin = createAdminClient();
 
@@ -1633,6 +1660,21 @@ Deno.serve(async (req) => {
       return jsonResponse({ success: true, data });
     }
 
+    if (action === 'order_status') {
+      const orderCode = String(body.orderCode ?? '').trim();
+      if (!orderCode) {
+        return errorResponse('Pedido inválido.', 400);
+      }
+      if (isRateLimited(`order-status:${orderCode}`, 30)) {
+        return errorResponse('Muitas consultas. Aguarde um momento.', 429);
+      }
+      if (isRateLimited(`order-status-ip:${clientIpKey}`, 120)) {
+        return errorResponse('Muitas consultas. Aguarde um momento.', 429);
+      }
+      const data = await getOrderStatus(orderCode);
+      return jsonResponse({ success: true, data });
+    }
+
     if (action === 'card') {
       const orderCode = String(body.orderCode ?? '').trim();
       if (orderCode && isRateLimited(`card:${orderCode}`)) {
@@ -1669,6 +1711,7 @@ Deno.serve(async (req) => {
       'CPF do titular inválido.',
       'Parcelamento inválido.',
       'Pedido não encontrado.',
+      'Pedido inválido.',
       'ID do PIX inválido.',
       'Pedido sem itens.',
       'Pagamento já confirmado.',
