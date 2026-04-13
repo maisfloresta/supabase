@@ -14,7 +14,12 @@ const ABACATEPAY_API_URL = 'https://api.abacatepay.com';
 const APPMAX_API_URL = Deno.env.get('APPMAX_API_URL') ?? 'https://api.appmax.com.br';
 const APPMAX_AUTH_URL = Deno.env.get('APPMAX_AUTH_URL') ?? 'https://auth.appmax.com.br/oauth2/token';
 const APPMAX_EXTERNAL_KEY = (Deno.env.get('APPMAX_DEFAULT_EXTERNAL_KEY') ?? 'quiz.maisfloresta.cloud').trim();
-const APPMAX_VALIDATION_APP_ID = Deno.env.get('APPMAX_VALIDATION_APP_ID')?.trim() || null;
+// The canonical Appmax App ID (UUID). Falls back to the legacy numeric
+// `APPMAX_VALIDATION_APP_ID` only if `APPMAX_APP_ID` is not set, so stale
+// installation rows bound to the old numeric app_id are ignored.
+const APPMAX_APP_ID = (Deno.env.get('APPMAX_APP_ID')?.trim())
+  || (Deno.env.get('APPMAX_VALIDATION_APP_ID')?.trim())
+  || null;
 const APPMAX_SOFT_DESCRIPTOR = (Deno.env.get('APPMAX_SOFT_DESCRIPTOR') ?? 'MAISFLORESTA').slice(0, 13);
 const CHECKOUT_DESCRIPTION = 'Receba Sementes - Mais Floresta';
 const CHECKOUT_EXPIRATION_SECONDS = 60 * 60; // 1 hour
@@ -629,8 +634,8 @@ async function getLatestAppmaxInstallation(admin: ReturnType<typeof createAdminC
     .order('created_at', { ascending: false })
     .limit(1);
 
-  if (APPMAX_VALIDATION_APP_ID) {
-    query = query.eq('app_id', APPMAX_VALIDATION_APP_ID);
+  if (APPMAX_APP_ID) {
+    query = query.eq('app_id', APPMAX_APP_ID);
   }
 
   const { data, error } = await query.maybeSingle<AppmaxInstallationRow>();
